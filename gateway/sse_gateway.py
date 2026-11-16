@@ -212,11 +212,85 @@ def _write_as_bash(name, args, schemas=None):
         return "Bash", {"command": f"echo '{b64}' | base64 -d > {shlex.quote(str(args['file_path']))}"}
     return name, args
 
+# DeepSeek DSML tool calls, the syntax the compact-tools prompt advertises below. Only the opening tags carry the
+# DSML marker; the closing tags are plain, as DeepSeek's chat template emits them.
+DSML_MARKER = "｜DSML｜"
+DSML_TOOL_OPEN = f"<{DSML_MARKER}tool_calls>"
+DSML_TOOL_CLOSE = "</tool_calls>"
+_DSML_INVOKE_RE = re.compile(rf"<{DSML_MARKER}invoke\s+([^>]*)>([\s\S]*?)</invoke>")
+_DSML_PARAM_RE = re.compile(rf"<{DSML_MARKER}parameter\s+([^>]*)>([\s\S]*?)</parameter>")
+_DSML_ATTR_RE = re.compile(r'([A-Za-z_][\w-]*)\s*=\s*"([^"]*)"')
+# The longest known marker minus one: the tail kept in the buffers so a tag split across deltas is still seen.
+_TAG_HOLDBACK = len(DSML_TOOL_OPEN) - 1
+
+
+def parse_dsml_tool_calls(text, schemas=None):
+    """The (name, input) calls of a DeepSeek DSML block, in order. `text` is a whole block or the block body (the
+    normalizer strips the opening tag before parsing), and only the opening tags carry the DSML marker."""
+    if DSML_TOOL_OPEN in text:
+        body = text.split(DSML_TOOL_OPEN, 1)[1]
+        close = body.find(DSML_TOOL_CLOSE)
+        if close != -1:
+            body = body[:close]
+    else:
+        body = text
+    calls = []
+    for inv in _DSML_INVOKE_RE.finditer(body):
+        attrs = dict(_DSML_ATTR_RE.findall(inv.group(1)))
+        name = attrs.get("name", "").strip()
+        # Same whitelist as the other formats: with schemas, a call to an unknown tool is refused.
+        if not name or (schemas and name not in schemas):
+            continue
+        props = (schemas or {}).get(name, {})
+        args = {}
+        for pm in _DSML_PARAM_RE.finditer(inv.group(2)):
+            pattrs = dict(_DSML_ATTR_RE.findall(pm.group(1)))
+            key = pattrs.get("name", "").strip()
+            if not key:
+                continue
+            raw, prop = pm.group(2), props.get(key, {})
+            if raw.startswith("\n"):
+                raw = raw[1:]
+            if raw.endswith("\n"):
+                raw = raw[:-1]
+            if pattrs.get("string") == "true":
+                args[key] = raw
+            elif pattrs.get("string") == "false" and not (isinstance(prop, dict) and prop.get("type")):
+                args[key] = _coerce_xml_param(raw, {})
+            else:
+                args[key] = _coerce_xml_param(raw, prop)
+        name, args = _write_as_bash(name, args, schemas)
+        calls.append({"name": name, "input": args})
+    return calls
+
+
+def parse_tool_calls(text, schemas=None):
+    """Every tool call in `text`: each DSML invoke, or the single call of the older formats."""
+    calls = parse_dsml_tool_calls(text, schemas)
+    if calls:
+        return calls
+    parsed = try_parse_tool_call(text, schemas)
+    return [parsed] if parsed else []
+
+
+def _tool_use_block(parsed):
+    return {
+        "type": "tool_use",
+        "id": "call_" + uuid.uuid4().hex[:12],
+        "name": parsed["name"],
+        "input": parsed["input"],
+    }
+
+
 def try_parse_tool_call(text, schemas=None):
     t = text.strip()
     if t.startswith("```"):
         t = re.sub(r"^```(?:json)?\s*", "", t)
         t = re.sub(r"\s*```$", "", t).strip()
+
+    if DSML_TOOL_OPEN in t:
+        calls = parse_dsml_tool_calls(t, schemas)
+        return calls[0] if calls else None
 
     m = re.search(r"<tool_call>([\s\S]*?)(?:</tool_call>|$)", t)
     if m:
@@ -275,7 +349,8 @@ class ThinkBlockFilter:
     Robust SSE stream normalizer for Claude Code (V3):
     - Uses --skip-chat-parsing from llama-server to completely prevent C++ PEG grammar aborts.
     - Intercepts <think>...</think> and converts into native Anthropic thinking/thinking_delta blocks.
-    - Intercepts <tool_call>...</tool_call> and converts into native Anthropic tool_use blocks.
+    - Intercepts <tool_call>...</tool_call> and DeepSeek DSML tool-call blocks and converts them into native
+      Anthropic tool_use blocks.
     - Resilient to tag ordering errors (tool_call inside think, missing </think>, stray tags).
     - Deduplicates identical tool calls.
     - Enforces hard cap of max_tool_calls (default 2) per turn.
@@ -291,6 +366,7 @@ class ThinkBlockFilter:
         self.tool_buf = ""
         self.seen_tools = set()
         self.tool_count = 0
+        self.tool_is_dsml = False
         self.has_content_block = False
         self.has_tool_call = False
         self.raw_sse_buf = ""
@@ -432,6 +508,33 @@ class ThinkBlockFilter:
 
         return [block]
 
+    def _emit_tool_call(self, out, parsed):
+        name = parsed.get("name")
+        args = parsed.get("input", {})
+        sig = (name, json.dumps(args, sort_keys=True))
+        if sig in self.seen_tools or self.tool_count >= self.max_tool_calls:
+            return
+        self.seen_tools.add(sig)
+        self.tool_count += 1
+        self.has_content_block = True
+        self.has_tool_call = True
+        cid = "call_" + uuid.uuid4().hex[:12]
+        out.append("event: content_block_start\ndata: " + json.dumps({
+            "type": "content_block_start",
+            "index": self.next_idx,
+            "content_block": {"type": "tool_use", "id": cid, "name": name, "input": {}}
+        }))
+        out.append("event: content_block_delta\ndata: " + json.dumps({
+            "type": "content_block_delta",
+            "index": self.next_idx,
+            "delta": {"type": "input_json_delta", "partial_json": json.dumps(args)}
+        }))
+        out.append("event: content_block_stop\ndata: " + json.dumps({
+            "type": "content_block_stop",
+            "index": self.next_idx
+        }))
+        self.next_idx += 1
+
     def _feed_text(self, text):
         out = []
         self.buf += text
@@ -449,6 +552,9 @@ class ThinkBlockFilter:
                 if self.buf.startswith("</tool_call>"):
                     self.buf = self.buf[12:]
                     continue
+                if self.buf.startswith(DSML_TOOL_CLOSE):
+                    self.buf = self.buf[len(DSML_TOOL_CLOSE):]
+                    continue
 
                 if self.buf.startswith("<think>"):
                     self.buf = self.buf[7:]
@@ -459,10 +565,16 @@ class ThinkBlockFilter:
                             "index": self.next_idx,
                             "content_block": {"type": "thinking", "thinking": ""}
                         }))
+                elif self.buf.startswith(DSML_TOOL_OPEN):
+                    self.buf = self.buf[len(DSML_TOOL_OPEN):]
+                    self.state = "TOOL"
+                    self.tool_buf = ""
+                    self.tool_is_dsml = True
                 elif self.buf.startswith("<tool_call>"):
                     self.buf = self.buf[11:]
                     self.state = "TOOL"
                     self.tool_buf = ""
+                    self.tool_is_dsml = False
                 else:
                     self.state = "TEXT"
                     self.has_content_block = True
@@ -475,6 +587,11 @@ class ThinkBlockFilter:
             elif self.state == "THINKING":
                 end_think = self.buf.find("</think>")
                 tool_call = self.buf.find("<tool_call>")
+                tool_dsml = False
+                dsml_call = self.buf.find(DSML_TOOL_OPEN)
+                if dsml_call != -1 and (tool_call == -1 or dsml_call < tool_call):
+                    tool_call = dsml_call
+                    tool_dsml = True
 
                 if tool_call != -1 and (end_think == -1 or tool_call < end_think):
                     chunk = self.buf[:tool_call]
@@ -492,9 +609,10 @@ class ThinkBlockFilter:
                             "index": self.next_idx
                         }))
                         self.next_idx += 1
-                    self.buf = self.buf[tool_call + 11:]
+                    self.buf = self.buf[tool_call + (len(DSML_TOOL_OPEN) if tool_dsml else 11):]
                     self.state = "TOOL"
                     self.tool_buf = ""
+                    self.tool_is_dsml = tool_dsml
                 elif end_think != -1:
                     chunk = self.buf[:end_think]
                     if chunk:
@@ -514,9 +632,9 @@ class ThinkBlockFilter:
                     self.buf = self.buf[end_think + 8:]
                     self.state = "INIT"
                 else:
-                    if len(self.buf) > 15:
-                        chunk = self.buf[:-15]
-                        self.buf = self.buf[-15:]
+                    if len(self.buf) > _TAG_HOLDBACK:
+                        chunk = self.buf[:-_TAG_HOLDBACK]
+                        self.buf = self.buf[-_TAG_HOLDBACK:]
                         self.thinking_buf += chunk
                         if self.mode != "no":
                             out.append("event: content_block_delta\ndata: " + json.dumps({
@@ -527,39 +645,16 @@ class ThinkBlockFilter:
                     break
 
             elif self.state == "TOOL":
-                end_tool = self.buf.find("</tool_call>")
+                closer = DSML_TOOL_CLOSE if self.tool_is_dsml else "</tool_call>"
+                end_tool = self.buf.find(closer)
                 if end_tool != -1:
                     self.tool_buf += self.buf[:end_tool]
-                    self.buf = self.buf[end_tool + 12:]
+                    self.buf = self.buf[end_tool + len(closer):]
                     raw_tool = self.tool_buf.strip()
                     self.tool_buf = ""
                     self.state = "INIT"
-                    parsed = try_parse_tool_call(raw_tool, self.schemas)
-                    if parsed:
-                        name = parsed.get("name")
-                        args = parsed.get("input", {})
-                        sig = (name, json.dumps(args, sort_keys=True))
-                        if sig not in self.seen_tools and self.tool_count < self.max_tool_calls:
-                            self.seen_tools.add(sig)
-                            self.tool_count += 1
-                            self.has_content_block = True
-                            self.has_tool_call = True
-                            cid = "call_" + uuid.uuid4().hex[:12]
-                            out.append("event: content_block_start\ndata: " + json.dumps({
-                                "type": "content_block_start",
-                                "index": self.next_idx,
-                                "content_block": {"type": "tool_use", "id": cid, "name": name, "input": {}}
-                            }))
-                            out.append("event: content_block_delta\ndata: " + json.dumps({
-                                "type": "content_block_delta",
-                                "index": self.next_idx,
-                                "delta": {"type": "input_json_delta", "partial_json": json.dumps(args)}
-                            }))
-                            out.append("event: content_block_stop\ndata: " + json.dumps({
-                                "type": "content_block_stop",
-                                "index": self.next_idx
-                            }))
-                            self.next_idx += 1
+                    for parsed in parse_tool_calls(raw_tool, self.schemas):
+                        self._emit_tool_call(out, parsed)
                 else:
                     self.tool_buf += self.buf
                     self.buf = ""
@@ -567,6 +662,9 @@ class ThinkBlockFilter:
 
             elif self.state == "TEXT":
                 tool_call = self.buf.find("<tool_call>")
+                dsml_call = self.buf.find(DSML_TOOL_OPEN)
+                if dsml_call != -1 and (tool_call == -1 or dsml_call < tool_call):
+                    tool_call = dsml_call
                 think = self.buf.find("<think>")
                 split_pos = -1
 
@@ -610,9 +708,9 @@ class ThinkBlockFilter:
                     self.buf = self.buf[split_pos:]
                     self.state = "INIT"
                 else:
-                    if len(self.buf) > 15:
-                        chunk = self.buf[:-15]
-                        self.buf = self.buf[-15:]
+                    if len(self.buf) > _TAG_HOLDBACK:
+                        chunk = self.buf[:-_TAG_HOLDBACK]
+                        self.buf = self.buf[-_TAG_HOLDBACK:]
                         clean_chunk = chunk.replace("</think>", "").replace("<think>", "")
                         if clean_chunk:
                             self.text_buf += clean_chunk
@@ -646,32 +744,8 @@ class ThinkBlockFilter:
                 self.next_idx += 1
         elif self.state == "TOOL":
             self.tool_buf += self.buf
-            parsed = try_parse_tool_call(self.tool_buf.strip(), self.schemas)
-            if parsed:
-                name = parsed.get("name")
-                args = parsed.get("input", {})
-                sig = (name, json.dumps(args, sort_keys=True))
-                if sig not in self.seen_tools and self.tool_count < self.max_tool_calls:
-                    self.seen_tools.add(sig)
-                    self.tool_count += 1
-                    self.has_content_block = True
-                    self.has_tool_call = True
-                    cid = "call_" + uuid.uuid4().hex[:12]
-                    out.append("event: content_block_start\ndata: " + json.dumps({
-                        "type": "content_block_start",
-                        "index": self.next_idx,
-                        "content_block": {"type": "tool_use", "id": cid, "name": name, "input": {}}
-                    }))
-                    out.append("event: content_block_delta\ndata: " + json.dumps({
-                        "type": "content_block_delta",
-                        "index": self.next_idx,
-                        "delta": {"type": "input_json_delta", "partial_json": json.dumps(args)}
-                    }))
-                    out.append("event: content_block_stop\ndata: " + json.dumps({
-                        "type": "content_block_stop",
-                        "index": self.next_idx
-                    }))
-                    self.next_idx += 1
+            for parsed in parse_tool_calls(self.tool_buf.strip(), self.schemas):
+                self._emit_tool_call(out, parsed)
         elif self.state == "TEXT":
             if self.buf:
                 clean = self.buf.replace("</think>", "").replace("<think>", "")
@@ -807,15 +881,11 @@ def sanitize_non_streaming_response(resp_dict, schemas=None):
                 thinking_extra.append(parts[0].replace("<think>", "").strip())
                 rem = parts[1].strip()
                 if rem:
-                    parsed = try_parse_tool_call(rem, schemas)
-                    if parsed:
+                    parsed_calls = parse_tool_calls(rem, schemas)
+                    if parsed_calls:
                         has_tool_call = True
-                        new_content.append({
-                            "type": "tool_use",
-                            "id": "call_" + uuid.uuid4().hex[:12],
-                            "name": parsed["name"],
-                            "input": parsed["input"]
-                        })
+                        for parsed in parsed_calls:
+                            new_content.append(_tool_use_block(parsed))
                     else:
                         block["text"] = rem
                         new_content.append(block)
@@ -825,15 +895,11 @@ def sanitize_non_streaming_response(resp_dict, schemas=None):
                     new_content.append({"type": "text", "text": parts[0].strip()})
                 thinking_extra.append(parts[1].strip())
             else:
-                parsed = try_parse_tool_call(txt, schemas)
-                if parsed:
+                parsed_calls = parse_tool_calls(txt, schemas)
+                if parsed_calls:
                     has_tool_call = True
-                    new_content.append({
-                        "type": "tool_use",
-                        "id": "call_" + uuid.uuid4().hex[:12],
-                        "name": parsed["name"],
-                        "input": parsed["input"]
-                    })
+                    for parsed in parsed_calls:
+                        new_content.append(_tool_use_block(parsed))
                 else:
                     new_content.append(block)
         elif b_type == "tool_use":
