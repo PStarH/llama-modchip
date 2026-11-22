@@ -9,7 +9,10 @@ the standalone `eakv_quantizer.py` prototype.
 import math
 import time
 import unittest
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    np = None
 try:
     from kv_cache.eakv_quantizer import EAKVEngine
 except ImportError:
@@ -123,6 +126,7 @@ def test_eakv_fidelity_and_compression():
 
 
 class TestEAKVCompression(unittest.TestCase):
+    @unittest.skipIf(np is None, "numpy is required for synthetic eakv compression simulation")
     def test_eakv_fidelity_and_compression(self):
         test_eakv_fidelity_and_compression()
 
