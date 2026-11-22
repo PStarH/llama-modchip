@@ -164,7 +164,7 @@ class HARPCacheEngine:
         with self.lock:
             if hasattr(self, "shm_mmap") and hasattr(self.shm_mmap, "close"):
                 self.shm_mmap.close()
-            if hasattr(self, "shm_file") and not self.shm_file.closed:
+            if getattr(self, "shm_file", None) is not None and not self.shm_file.closed:
                 self.shm_file.close()
 
     def calculate_entropy(self, tokens: List[int]) -> float:

@@ -170,6 +170,15 @@ class TestHARPCache(unittest.TestCase):
             if os.path.exists(div_shm):
                 os.remove(div_shm)
 
+    def test_close_without_active_shm_does_not_raise(self):
+        """Fallback anonymous heap buffer mode has shm_file=None; close() must be idempotent."""
+        engine = HARPCacheEngine(shm_path="/nonexistent/path/for/shm.bin", max_pages=4)
+        self.assertFalse(engine.shm_active)
+        self.assertIsNone(engine.shm_file)
+        # Must not raise AttributeError: 'NoneType' object has no attribute 'closed'
+        engine.close()
+        engine.close()
+
 
 if __name__ == "__main__":
     unittest.main()
