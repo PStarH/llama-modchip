@@ -234,6 +234,36 @@ class NativeBlockIndexTest(unittest.TestCase):
                     [t for _, t in starts], ["text", "thinking", "text"]
                 )
 
+    def test_native_thinking_after_text_in_no_think_mode(self):
+        """mode=no still emits the text block; its stop must be closed when thinking follows."""
+        stream = self._native_stream()
+        for feed_size in (1, 3, 7, 64, 4096):
+            with self.subTest(feed=feed_size):
+                stream_filter = gw.ThinkBlockFilter(mode="no", schemas={})
+                rendered = ""
+                for i in range(0, len(stream), feed_size):
+                    rendered += stream_filter.feed(stream[i:i + feed_size])
+                rendered += stream_filter.flush()
+                events = _events(rendered)
+
+                opened = [
+                    e["index"] for e in events
+                    if e["type"] == "content_block_start"
+                ]
+                stopped = [
+                    e["index"] for e in events
+                    if e["type"] == "content_block_stop"
+                ]
+                self.assertEqual(len(opened), len(set(opened)),
+                                 f"duplicate block index in {opened}")
+                self.assertEqual(sorted(opened), sorted(stopped),
+                                 f"block lifecycle mismatch: {opened} vs {stopped}")
+                # thinking content must be suppressed in mode=no
+                self.assertFalse(any(
+                    e.get("delta", {}).get("type") == "thinking_delta"
+                    for e in events
+                ))
+
 
 if __name__ == "__main__":
     unittest.main()

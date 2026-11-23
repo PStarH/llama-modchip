@@ -611,12 +611,13 @@ class ThinkBlockFilter:
                                 "delta": {"type": "text_delta", "text": clean}
                             }))
                         self.buf = ""
-                    if self.mode != "no":
-                        out.append("event: content_block_stop\ndata: " + json.dumps({
-                            "type": "content_block_stop",
-                            "index": self.next_idx
-                        }))
-                        self.next_idx += 1
+                    # The text block was already emitted (even in mode "no"), so it
+                    # must always be closed and its index retired regardless of mode.
+                    out.append("event: content_block_stop\ndata: " + json.dumps({
+                        "type": "content_block_stop",
+                        "index": self.next_idx
+                    }))
+                    self.next_idx += 1
                     self.native_text_open = False
                     self.state = "INIT"
                 self.upstream_thinking_open = True
