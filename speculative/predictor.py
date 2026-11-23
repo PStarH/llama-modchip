@@ -33,7 +33,7 @@ def _build_lib() -> str:
     if not src.exists():
         raise FileNotFoundError(f"Source not found: {src}")
     result = subprocess.run(
-        ["g++", "-O2", "-shared", "-fPIC", "-o", str(out),
+        ["g++", "-std=c++17", "-O2", "-shared", "-fPIC", "-o", str(out),
          str(src), "-lpthread"],
         capture_output=True, text=True
     )
