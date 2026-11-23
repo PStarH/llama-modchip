@@ -663,7 +663,28 @@ def detect_memory_and_thp():
         tot = run_cmd("sysctl -n hw.memsize")
         if tot.isdigit():
             mem["total_gb"] = int(tot) / (1024.0 ** 3)
-            mem["available_gb"] = mem["total_gb"] * 0.75
+            avail_gb = None
+            try:
+                pagesize_str = run_cmd("sysctl -n hw.pagesize")
+                page_size = int(pagesize_str) if pagesize_str.isdigit() else 16384
+                vm_out = run_cmd("vm_stat")
+                vm_stats = {}
+                for line in vm_out.splitlines():
+                    if ":" in line:
+                        k, v = line.split(":", 1)
+                        num_part = re.search(r"\d+", v)
+                        if num_part:
+                            vm_stats[k.strip().lower()] = int(num_part.group())
+                free_pages = vm_stats.get("pages free", 0)
+                inactive_pages = vm_stats.get("pages inactive", 0)
+                purgeable_pages = vm_stats.get("pages purgeable", 0)
+                speculative_pages = vm_stats.get("pages speculative", 0)
+                total_avail_pages = free_pages + inactive_pages + purgeable_pages + speculative_pages
+                if total_avail_pages > 0:
+                    avail_gb = (total_avail_pages * page_size) / (1024.0 ** 3)
+            except Exception:
+                pass
+            mem["available_gb"] = avail_gb if (avail_gb is not None and 0.0 < avail_gb <= mem["total_gb"]) else (mem["total_gb"] * 0.75)
         mem["thp_enabled"] = "macos_superpages"
     elif platform.system() == "Windows":
         _detect_windows_memory(mem)
