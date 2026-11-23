@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Dict, List, Optional, Tuple
 
@@ -557,6 +558,11 @@ def get_server_affinity_summary(base_url: str) -> str:
     return f"mask={mask_str}{meta_suffix}"
 
 
+def _report_connection_error(base_url: str, err: Exception) -> None:
+    print(f"\n{YELLOW}[!] Connection error ({base_url}): {err}{RESET}")
+    print(f"    Make sure the server is running via: {BOLD}./modchip start{RESET}\n")
+
+
 def stream_chat_turn(
     base_url: str,
     messages: List[Dict[str, str]],
@@ -756,8 +762,12 @@ def run_benchmark_suite(base_url: str) -> None:
             "content": "Write a cache-line aligned (alignas(64)) SPSC lock-free ring buffer in C++20 using std::atomic with acquire/release memory ordering.",
         },
     ]
-    s1 = stream_chat_turn(base_url, msgs1, max_tokens=250, think_budget=0, quiet=False, raw_model_id=raw_model, deterministic=True)
-    print_turn_telemetry(s1, spec_label=spec_lbl)
+    try:
+        s1 = stream_chat_turn(base_url, msgs1, max_tokens=250, think_budget=0, quiet=False, raw_model_id=raw_model, deterministic=True)
+        print_turn_telemetry(s1, spec_label=spec_lbl)
+    except urllib.error.URLError as e:
+        _report_connection_error(base_url, e)
+        sys.exit(1)
 
     # Stage 2: In-Context Code Refactoring
     print(f"\n{BOLD}[2/2] Stage 2: In-Context Code Refactoring — {spec_lbl} Burst (350 tokens)...{RESET}")
@@ -772,8 +782,12 @@ def run_benchmark_suite(base_url: str) -> None:
             ),
         },
     ]
-    s2 = stream_chat_turn(base_url, msgs2, max_tokens=350, think_budget=0, quiet=False, raw_model_id=raw_model, deterministic=True)
-    print_turn_telemetry(s2, spec_label=spec_lbl)
+    try:
+        s2 = stream_chat_turn(base_url, msgs2, max_tokens=350, think_budget=0, quiet=False, raw_model_id=raw_model, deterministic=True)
+        print_turn_telemetry(s2, spec_label=spec_lbl)
+    except urllib.error.URLError as e:
+        _report_connection_error(base_url, e)
+        sys.exit(1)
 
     pp_best = max(s1["pp_tps"], s2["pp_tps"])
     if s2["draft_n"] > 0:
@@ -825,7 +839,6 @@ def run_benchmark_suite(base_url: str) -> None:
     print(f"  Decode (New C++20)  : {s1['dec_tps']:.2f} tok/s (TTFT: {s1['ttft_ms']:.0f} ms)")
     print(f"  Decode (Refactor)   : {s2['dec_tps']:.2f} tok/s ({s2_spec_note})")
     print(f"{BOLD}{GREEN}╚════════════════════════════════════════════════════════════════════════════════════╝{RESET}")
-    import urllib.parse
     q_params = urllib.parse.urlencode(
         {
             "template": "cpu_benchmark_submission.yml",
@@ -865,8 +878,12 @@ def run_interactive_chat(base_url: str, one_shot_prompt: Optional[str] = None) -
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": one_shot_prompt},
         ]
-        stats = stream_chat_turn(base_url, msgs, max_tokens=1024, think_budget=0, quiet=False, raw_model_id=raw_model)
-        print_turn_telemetry(stats, spec_label=spec_lbl)
+        try:
+            stats = stream_chat_turn(base_url, msgs, max_tokens=1024, think_budget=0, quiet=False, raw_model_id=raw_model)
+            print_turn_telemetry(stats, spec_label=spec_lbl)
+        except urllib.error.URLError as e:
+            _report_connection_error(base_url, e)
+            sys.exit(1)
         return
 
     print(f"{BOLD}{CYAN}╔════════════════════════════════════════════════════════════════════════════════════╗{RESET}")
@@ -924,8 +941,7 @@ def run_interactive_chat(base_url: str, one_shot_prompt: Optional[str] = None) -
             print_turn_telemetry(stats, spec_label=spec_lbl)
             print()
         except urllib.error.URLError as e:
-            print(f"\n{YELLOW}[!] Connection error ({base_url}): {e}{RESET}")
-            print(f"    Make sure the server is running via: {BOLD}./modchip start{RESET}\n")
+            _report_connection_error(base_url, e)
             messages.pop()
 
 
