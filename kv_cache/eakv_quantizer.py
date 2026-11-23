@@ -13,7 +13,7 @@ import math
 import struct
 import time
 import numpy as np
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 
 # FNV-1a 64-bit Constants
 FNV_OFFSET = 0xcbf29ce484222325
@@ -28,6 +28,18 @@ def fnv1a_hash(tokens: List[int]) -> int:
             h = ((h ^ b) * FNV_PRIME) & MASK_64
     return h
 
+# Precomputed 4-bit unpacking lookup table (256 bytes -> 2 signed float32 values)
+_Q4_UNPACK_LUT = np.empty((256, 2), dtype=np.float32)
+for _b in range(256):
+    _low = _b & 0x0F
+    if _low >= 8:
+        _low -= 16
+    _high = (_b >> 4) & 0x0F
+    if _high >= 8:
+        _high -= 16
+    _Q4_UNPACK_LUT[_b, 0] = _low
+    _Q4_UNPACK_LUT[_b, 1] = _high
+
 class EAKVCell:
     """
     Dual-format KV memory cell representing a single token's key and value projections.
@@ -35,23 +47,40 @@ class EAKVCell:
     """
     __slots__ = ("token_id", "pos", "precision", "k_fp16", "v_fp16", "k_q4_bytes", "v_q4_bytes", "k_scale", "v_scale", "entropy")
     
-    def __init__(self, token_id: int, pos: int, precision: str, k_fp16: np.ndarray, v_fp16: np.ndarray, entropy: float):
+    def __init__(
+        self,
+        token_id: int,
+        pos: int,
+        precision: str,
+        k_fp16: Optional[np.ndarray],
+        v_fp16: Optional[np.ndarray],
+        entropy: float,
+        k_q4_bytes: Optional[bytes] = None,
+        v_q4_bytes: Optional[bytes] = None,
+        k_scale: float = 1.0,
+        v_scale: float = 1.0,
+    ):
         self.token_id = token_id
         self.pos = pos              # Virtual Positional Index (original coordinate m)
         self.precision = precision  # 'FP16' or 'Q4_0'
         self.entropy = entropy
         
         if precision == 'FP16':
-            self.k_fp16 = k_fp16.astype(np.float16)
-            self.v_fp16 = v_fp16.astype(np.float16)
+            self.k_fp16 = k_fp16.astype(np.float16) if (k_fp16 is not None and k_fp16.dtype != np.float16) else k_fp16
+            self.v_fp16 = v_fp16.astype(np.float16) if (v_fp16 is not None and v_fp16.dtype != np.float16) else v_fp16
             self.k_q4_bytes = None
             self.v_q4_bytes = None
             self.k_scale = 1.0
             self.v_scale = 1.0
         else: # Q4_0
-            # Quantize K and V into 4-bit nibbles with block scale
-            self.k_q4_bytes, self.k_scale = self._quantize_q4_0(k_fp16)
-            self.v_q4_bytes, self.v_scale = self._quantize_q4_0(v_fp16)
+            if k_q4_bytes is not None and v_q4_bytes is not None:
+                self.k_q4_bytes = k_q4_bytes
+                self.v_q4_bytes = v_q4_bytes
+                self.k_scale = k_scale
+                self.v_scale = v_scale
+            else:
+                self.k_q4_bytes, self.k_scale = self._quantize_q4_0(k_fp16)
+                self.v_q4_bytes, self.v_scale = self._quantize_q4_0(v_fp16)
             self.k_fp16 = None
             self.v_fp16 = None
 
@@ -75,36 +104,15 @@ class EAKVCell:
         """Dequantizes Key vector back to float32 for attention calculation."""
         if self.precision == 'FP16':
             return self.k_fp16.astype(np.float32)
-        
-        # Unpack Q4_0
         raw = np.frombuffer(self.k_q4_bytes, dtype=np.uint8)
-        low = (raw & 0x0F).astype(np.int8)
-        # Sign extension for 4-bit
-        low = np.where(low >= 8, low - 16, low)
-        
-        high = ((raw >> 4) & 0x0F).astype(np.int8)
-        high = np.where(high >= 8, high - 16, high)
-        
-        unpacked = np.empty(len(raw) * 2, dtype=np.float32)
-        unpacked[0::2] = low * self.k_scale
-        unpacked[1::2] = high * self.k_scale
-        return unpacked
+        return _Q4_UNPACK_LUT[raw].reshape(-1) * self.k_scale
 
     def dequantize_v(self) -> np.ndarray:
         """Dequantizes Value vector back to float32 for attention aggregation."""
         if self.precision == 'FP16':
             return self.v_fp16.astype(np.float32)
-        
         raw = np.frombuffer(self.v_q4_bytes, dtype=np.uint8)
-        low = (raw & 0x0F).astype(np.int8)
-        low = np.where(low >= 8, low - 16, low)
-        high = ((raw >> 4) & 0x0F).astype(np.int8)
-        high = np.where(high >= 8, high - 16, high)
-        
-        unpacked = np.empty(len(raw) * 2, dtype=np.float32)
-        unpacked[0::2] = low * self.v_scale
-        unpacked[1::2] = high * self.v_scale
-        return unpacked
+        return _Q4_UNPACK_LUT[raw].reshape(-1) * self.v_scale
 
     def byte_size(self) -> int:
         """Returns physical memory consumption in bytes."""
@@ -135,23 +143,21 @@ class EAKVEngine:
         self.inv_freq = 1.0 / (self.ROPE_BASE ** (dim_indices / self.HEAD_DIM))
 
     def apply_rope(self, vec: np.ndarray, pos: int) -> np.ndarray:
-        """Applies Rotary Position Embedding (RoPE) at absolute virtual position pos."""
-        v = vec.copy()
-        # Compute angles theta = pos * inv_freq
+        """Applies Rotary Position Embedding (RoPE) at absolute virtual position pos (supports 1D or ND)."""
         angles = pos * self.inv_freq
         cos = np.cos(angles)
         sin = np.sin(angles)
         
-        # Split into even and odd components
-        v_even = v[0::2]
-        v_odd = v[1::2]
+        # Split into even and odd components along last axis
+        v_even = vec[..., 0::2]
+        v_odd  = vec[..., 1::2]
         
         rot_even = v_even * cos - v_odd * sin
         rot_odd  = v_even * sin + v_odd * cos
         
-        out = np.empty_like(v)
-        out[0::2] = rot_even
-        out[1::2] = rot_odd
+        out = np.empty_like(vec)
+        out[..., 0::2] = rot_even
+        out[..., 1::2] = rot_odd
         return out
 
     def classify_entropy_stream(self, tokens: List[int]) -> List[Tuple[float, str]]:
@@ -188,27 +194,58 @@ class EAKVEngine:
                     
         return final_classes
 
+    @staticmethod
+    def _quantize_q4_0_batch(tensor: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Vectorized batch quantization of shape (..., 128) into packed uint8 nibbles and scales."""
+        max_val = np.max(np.abs(tensor), axis=-1)
+        scale = np.where(max_val == 0.0, 1.0, max_val / 7.0)
+        scaled = np.clip(np.round(tensor / scale[..., np.newaxis]), -7, 7).astype(np.int8)
+        low = scaled[..., 0::2] & 0x0F
+        high = (scaled[..., 1::2] & 0x0F) << 4
+        packed = (low | high).astype(np.uint8)
+        return packed, scale
+
     def ingest_token(self, token_id: int, pos: int, precision: str, entropy: float, layer_k_projections: np.ndarray, layer_v_projections: np.ndarray):
         """
         Ingests a token into all layers and KV heads with specified precision and virtual position pos.
+        Uses vectorized RoPE rotation and batched Q4_0 quantization across all (layers, heads).
         """
-        for l in range(self.n_layers):
-            for h in range(self.n_kv_heads):
-                k_raw = layer_k_projections[l, h]
-                v_raw = layer_v_projections[l, h]
-                
-                # Apply VPI RoPE at absolute virtual coordinate pos
-                k_rot = self.apply_rope(k_raw, pos=pos)
-                
-                cell = EAKVCell(
-                    token_id=token_id,
-                    pos=pos,
-                    precision=precision,
-                    k_fp16=k_rot,
-                    v_fp16=v_raw,
-                    entropy=entropy
-                )
-                self.cells[l][h].append(cell)
+        # Vectorized RoPE rotation across all (layers, heads) in a single tensor operation
+        k_rot_all = self.apply_rope(layer_k_projections, pos=pos)
+        
+        if precision == 'FP16':
+            k_fp16_all = k_rot_all.astype(np.float16)
+            v_fp16_all = layer_v_projections.astype(np.float16)
+            for l in range(self.n_layers):
+                for h in range(self.n_kv_heads):
+                    cell = EAKVCell(
+                        token_id=token_id,
+                        pos=pos,
+                        precision='FP16',
+                        k_fp16=k_fp16_all[l, h],
+                        v_fp16=v_fp16_all[l, h],
+                        entropy=entropy,
+                    )
+                    self.cells[l][h].append(cell)
+        else: # Q4_0: Batched vectorized quantization across all layers and heads
+            k_packed, k_scales = self._quantize_q4_0_batch(k_rot_all)
+            v_packed, v_scales = self._quantize_q4_0_batch(layer_v_projections)
+            
+            for l in range(self.n_layers):
+                for h in range(self.n_kv_heads):
+                    cell = EAKVCell(
+                        token_id=token_id,
+                        pos=pos,
+                        precision='Q4_0',
+                        k_fp16=None,
+                        v_fp16=None,
+                        entropy=entropy,
+                        k_q4_bytes=k_packed[l, h].tobytes(),
+                        v_q4_bytes=v_packed[l, h].tobytes(),
+                        k_scale=float(k_scales[l, h]),
+                        v_scale=float(v_scales[l, h]),
+                    )
+                    self.cells[l][h].append(cell)
 
     def compute_attention(self, layer_idx: int, head_idx: int, query_vec: np.ndarray, query_pos: int) -> Tuple[np.ndarray, np.ndarray]:
         """
