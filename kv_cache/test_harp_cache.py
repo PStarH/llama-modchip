@@ -179,6 +179,51 @@ class TestHARPCache(unittest.TestCase):
         engine.close()
         engine.close()
 
+    def test_hash_collision_does_not_leave_stale_radix_page(self):
+        """
+        A 64-bit hash collision must evict the colliding page from the Radix Tree at
+        EVERY depth it occupies. `_radix_nodes` is keyed by hash alone, so the O(1)
+        prune fast path only sees the deepest parent link and used to leave an outer
+        node holding a page that had already been evicted and whose physical slot had
+        been recycled - resolve_prefix then returned that stale page as a cache hit.
+        """
+        import kv_cache.harp_cache as harp_mod
+        shm = f"/dev/shm/harp_kv_cache_test_collide_{_UID}.bin"
+        original = harp_mod.hash_token_block
+        engine = HARPCacheEngine(shm_path=shm, max_pages=4)
+        try:
+            # Force every block to hash to the same value -> guaranteed 64-bit collision.
+            harp_mod.hash_token_block = lambda tokens, prev_hash=harp_mod.FNV_OFFSET_BASIS: 999
+            block_a = [3000 + i for i in range(32)]
+            block_b = [7000 + i for i in range(32)]
+
+            # Store A, hit A again, then store B -> B collides with A and evicts it.
+            engine.store_prefix(block_a + block_a + block_b)
+
+            # The colliding page must be gone: A must NOT resolve as a cache hit.
+            cached, matched, remaining = engine.resolve_prefix(block_a)
+            self.assertEqual(cached, 0, "evicted page must not resolve as a hit")
+            self.assertEqual(matched, [])
+            self.assertEqual(len(remaining), 32)
+
+            # No Radix node may still point at the evicted page.
+            stale = [
+                entry.get("page")
+                for entry in engine.radix_root.values()
+                if entry.get("page") is not None and entry["page"].tokens == block_a
+            ]
+            self.assertEqual(stale, [], "Radix Tree still references the evicted page")
+
+            # The surviving page must still resolve correctly.
+            cached_b, matched_b, _ = engine.resolve_prefix(block_b)
+            self.assertEqual(cached_b, 32)
+            self.assertEqual(matched_b[0].tokens, block_b)
+        finally:
+            harp_mod.hash_token_block = original
+            engine.close()
+            if os.path.exists(shm):
+                os.remove(shm)
+
 
 if __name__ == "__main__":
     unittest.main()

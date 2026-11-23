@@ -182,7 +182,7 @@ class HARPCacheEngine:
         unique_tokens = len(set(tokens))
         return float(unique_tokens) / float(len(tokens))
 
-    def _prune_radix_hash(self, root_node: Dict[int, Dict[str, Any]], target_hash: int) -> None:
+    def _prune_radix_hash(self, root_node: Dict[int, Dict[str, Any]], target_hash: int, force_full_scan: bool = False) -> None:
         """
         Removes an evicted page_hash from the Radix Tree in O(1) / O(depth) time without
         destroying active descendant subtrees or hitting Python's recursion limit:
@@ -191,8 +191,14 @@ class HARPCacheEngine:
           suffix pages remain attached to the Radix Tree.
         - Only deletes from `parent_dict` when `"children"` is empty, propagating pruning upward.
         - Falls back to stack-based bottom-up traversal if target_hash is not in `_radix_nodes`.
+
+        `force_full_scan=True` removes EVERY node keyed by `target_hash` at any depth. It is
+        required for the 64-bit hash-collision path: `_radix_nodes` is keyed by hash alone, so
+        when the same hash occurs at several depths only the deepest parent link is recorded.
+        The O(1) fast path would then prune just that one node and leave an outer node still
+        holding a page that was already evicted and whose physical slot has been recycled.
         """
-        if root_node is self.radix_root and target_hash in self._radix_nodes:
+        if not force_full_scan and root_node is self.radix_root and target_hash in self._radix_nodes:
             parent_h, parent_dict, entry = self._radix_nodes[target_hash]
             if entry.get("children"):
                 entry["page"] = None
@@ -212,6 +218,31 @@ class HARPCacheEngine:
                     curr_h = gp_h
                 else:
                     break
+            return
+
+        if force_full_scan:
+            # Remove EVERY node keyed by `target_hash` at any depth. Nodes that still own
+            # descendants keep their subtree reachable but drop the stale page reference.
+            stack = [root_node]
+            while stack:
+                node = stack.pop()
+                for child_hash, child_entry in list(node.items()):
+                    if child_hash == target_hash:
+                        children = child_entry.get("children")
+                        if children:
+                            child_entry["page"] = None
+                        else:
+                            del node[child_hash]
+                            self._radix_nodes.pop(child_hash, None)
+                            continue
+                    else:
+                        children = child_entry.get("children")
+                        if child_entry.get("page") is None and not children:
+                            del node[child_hash]
+                            self._radix_nodes.pop(child_hash, None)
+                            continue
+                    if children:
+                        stack.append(children)
             return
 
         # Stack-based bottom-up traversal fallback (for external callers or untracked nodes)
@@ -340,8 +371,12 @@ class HARPCacheEngine:
                     page = existing
                 else:
                     if existing is not None:
-                        # 64-bit hash collision with distinct token block: evict & recycle colliding entry cleanly
-                        self._prune_radix_hash(self.radix_root, h)
+                        # 64-bit hash collision with distinct token block: evict & recycle colliding entry cleanly.
+                        # The same hash can already exist at several depths of the Radix Tree, and
+                        # `_radix_nodes` only tracks one parent link per hash, so the O(1) fast
+                        # path would leave an outer node holding the evicted (and already
+                        # recycled) page. Prune every occurrence instead.
+                        self._prune_radix_hash(self.radix_root, h, force_full_scan=True)
                         colliding_page = self.hash_to_page.pop(h)
                         self.free_page_ids.append(colliding_page.page_id)
                         self.evictions += 1
