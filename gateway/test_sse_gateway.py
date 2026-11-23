@@ -158,5 +158,82 @@ class ToolCallStreamingTest(unittest.TestCase):
                 self.assertNotIn("</tool_call>", visible)
 
 
+class NativeBlockIndexTest(unittest.TestCase):
+    """Native thinking-after-text streams must never reuse or orphan block indices."""
+
+    def _native_stream(self):
+        def cb_start(index, cb):
+            return _event("content_block_start", index=index, content_block=cb)
+
+        def cb_delta(index, delta):
+            return _event("content_block_delta", index=index, delta=delta)
+
+        return (
+            _event(
+                "message_start",
+                message={
+                    "id": "msg", "type": "message", "role": "assistant",
+                    "content": [], "model": "test", "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            )
+            + cb_start(0, {"type": "text", "text": ""})
+            + cb_delta(0, {"type": "text_delta", "text": "Here"})
+            + _event("content_block_stop", index=0)
+            + cb_start(1, {"type": "thinking", "thinking": ""})
+            + cb_delta(1, {"type": "thinking_delta", "thinking": "double check"})
+            + _event("content_block_stop", index=1)
+            + cb_start(2, {"type": "text", "text": ""})
+            + cb_delta(2, {"type": "text_delta", "text": "Final: 42."})
+            + _event("content_block_stop", index=2)
+            + _event(
+                "message_delta",
+                delta={"stop_reason": "end_turn", "stop_sequence": None},
+                usage={"output_tokens": 3},
+            )
+            + _event("message_stop")
+        )
+
+    def test_native_thinking_after_text_uses_distinct_indices(self):
+        stream = self._native_stream()
+        for feed_size in (1, 2, 3, 5, 7, 11, 13, 4096):
+            with self.subTest(feed=feed_size):
+                stream_filter = gw.ThinkBlockFilter(mode="med", schemas={})
+                rendered = ""
+                for i in range(0, len(stream), feed_size):
+                    rendered += stream_filter.feed(stream[i:i + feed_size])
+                rendered += stream_filter.flush()
+                events = _events(rendered)
+
+                starts = [
+                    (e["index"], e["content_block"]["type"])
+                    for e in events
+                    if e["type"] == "content_block_start"
+                ]
+                stops = [e["index"] for e in events if e["type"] == "content_block_stop"]
+                deltas = [
+                    (e["index"], e["delta"]["type"])
+                    for e in events
+                    if e["type"] == "content_block_delta"
+                ]
+                opened = [i for i, _ in starts]
+                self.assertEqual(
+                    len(opened), len(set(opened)),
+                    f"duplicate block index in {starts}",
+                )
+                self.assertEqual(
+                    sorted(opened), sorted(set(stops)),
+                    "every opened block must be stopped exactly once",
+                )
+                self.assertTrue(
+                    all(i in opened for i, _ in deltas),
+                    f"delta on a block that never opened: {deltas}",
+                )
+                self.assertEqual(
+                    [t for _, t in starts], ["text", "thinking", "text"]
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

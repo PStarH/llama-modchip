@@ -516,6 +516,7 @@ class ThinkBlockFilter:
         self.raw_sse_buf = ""
         self.thinking_buf = ""
         self.text_buf = ""
+        self.native_text_open = False
 
     def feed(self, chunk: str) -> str:
         self.raw_sse_buf += chunk.replace("\r\n", "\n")
@@ -579,6 +580,7 @@ class ThinkBlockFilter:
                     }))
                     self.next_idx += 1
                     self.state = "INIT"
+                    self.native_text_open = False
                 elif self.state == "THINKING":
                     if self.mode != "no":
                         out.append("event: content_block_stop\ndata: " + json.dumps({
@@ -595,11 +597,34 @@ class ThinkBlockFilter:
                 out.append("event: content_block_start\ndata: " + json.dumps(ev))
                 return out
             elif cb_type == "thinking":
+                # A native thinking block may follow a text block that _feed_text
+                # opened lazily. Close it first so the two blocks never share an index.
+                out = []
+                if self.state == "TEXT" and self.native_text_open:
+                    if self.buf:
+                        clean = self.buf.replace("</think>", "").replace("<think>", "")
+                        if clean:
+                            self.text_buf += clean
+                            out.append("event: content_block_delta\ndata: " + json.dumps({
+                                "type": "content_block_delta",
+                                "index": self.next_idx,
+                                "delta": {"type": "text_delta", "text": clean}
+                            }))
+                        self.buf = ""
+                    if self.mode != "no":
+                        out.append("event: content_block_stop\ndata: " + json.dumps({
+                            "type": "content_block_stop",
+                            "index": self.next_idx
+                        }))
+                        self.next_idx += 1
+                    self.native_text_open = False
+                    self.state = "INIT"
                 self.upstream_thinking_open = True
                 if self.mode != "no":
                     self.upstream_thinking_idx = self.next_idx
                     ev["index"] = self.upstream_thinking_idx
-                    return ["event: content_block_start\ndata: " + json.dumps(ev)]
+                    out.append("event: content_block_start\ndata: " + json.dumps(ev))
+                return out
             return []
 
         if t == "content_block_delta":
@@ -728,6 +753,7 @@ class ThinkBlockFilter:
                 else:
                     self.state = "TEXT"
                     self.has_content_block = True
+                    self.native_text_open = True
                     out.append("event: content_block_start\ndata: " + json.dumps({
                         "type": "content_block_start",
                         "index": self.next_idx,
@@ -949,6 +975,7 @@ class ThinkBlockFilter:
                 "index": self.next_idx
             }))
             self.next_idx += 1
+            self.native_text_open = False
 
         self.buf = ""
         self.tool_buf = ""
