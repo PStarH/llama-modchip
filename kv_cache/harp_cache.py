@@ -35,6 +35,9 @@ FNV_PRIME = 0x100000001b3
 MASK_64 = 0xffffffffffffffff
 
 
+_STRUCT_32I = struct.Struct("<32i")
+
+
 def fnv1a_64(data: bytes, seed: int = FNV_OFFSET_BASIS) -> int:
     """Computes high-speed 64-bit FNV-1a hash over raw byte buffer."""
     h = seed
@@ -50,7 +53,10 @@ def hash_token_block(tokens: List[int], prev_hash: int = FNV_OFFSET_BASIS) -> in
     When called with `prev_hash`, guarantees diverging prefixes [A, C] and [B, C]
     produce distinct hashes for block C (preserving causal attention & SSM soundness).
     """
-    raw = struct.pack(f"{len(tokens)}i", *tokens)
+    if len(tokens) == 32:
+        raw = _STRUCT_32I.pack(*tokens)
+    else:
+        raw = struct.pack(f"<{len(tokens)}i", *tokens)
     return fnv1a_64(raw, seed=prev_hash)
 
 
@@ -113,6 +119,8 @@ class HARPCacheEngine:
 
         # Prefix Radix Tree: each node is Dict[chained_hash, {"page": HARPPage, "children": dict}]
         self.radix_root: Dict[int, Dict[str, Any]] = {}
+        # Fast parent index: chained_hash -> (parent_hash, parent_dict, entry_dict)
+        self._radix_nodes: Dict[int, Tuple[Optional[int], Dict[int, Dict[str, Any]], Dict[str, Any]]] = {}
 
         # Physical page allocator (monotonic watermark + recycled free-list)
         self.allocated_pages = 0
@@ -176,14 +184,37 @@ class HARPCacheEngine:
 
     def _prune_radix_hash(self, root_node: Dict[int, Dict[str, Any]], target_hash: int) -> None:
         """
-        Iteratively removes an evicted page_hash from the Radix Tree without
-        destroying active descendant subtrees or hitting Python's recursion limit
-        on deep prefix chains (> 1,000 pages):
-        - Traverses children bottom-up using an explicit stack.
-        - If `node[target_hash]["children"]` is non-empty, sets `node[target_hash]["page"] = None`
-          so descendant suffix pages remain attached to the Radix Tree.
-        - Only deletes `node[target_hash]` when `"children"` is empty.
+        Removes an evicted page_hash from the Radix Tree in O(1) / O(depth) time without
+        destroying active descendant subtrees or hitting Python's recursion limit:
+        - If `target_hash` is recorded in `_radix_nodes`, directly retrieves (parent_hash, parent_dict, entry).
+        - If `entry["children"]` is non-empty, sets `entry["page"] = None` so descendant
+          suffix pages remain attached to the Radix Tree.
+        - Only deletes from `parent_dict` when `"children"` is empty, propagating pruning upward.
+        - Falls back to stack-based bottom-up traversal if target_hash is not in `_radix_nodes`.
         """
+        if root_node is self.radix_root and target_hash in self._radix_nodes:
+            parent_h, parent_dict, entry = self._radix_nodes[target_hash]
+            if entry.get("children"):
+                entry["page"] = None
+                return
+
+            self._radix_nodes.pop(target_hash, None)
+            if target_hash in parent_dict:
+                del parent_dict[target_hash]
+
+            curr_h = parent_h
+            while curr_h is not None and curr_h in self._radix_nodes:
+                gp_h, p_dict, p_entry = self._radix_nodes[curr_h]
+                if p_entry.get("page") is None and not p_entry.get("children"):
+                    self._radix_nodes.pop(curr_h, None)
+                    if curr_h in p_dict:
+                        del p_dict[curr_h]
+                    curr_h = gp_h
+                else:
+                    break
+            return
+
+        # Stack-based bottom-up traversal fallback (for external callers or untracked nodes)
         stack: List[Tuple[Dict[int, Dict[str, Any]], bool]] = [(root_node, False)]
         while stack:
             node, visited_children = stack.pop()
@@ -198,11 +229,13 @@ class HARPCacheEngine:
                     children = child_entry.get("children")
                     if child_hash != target_hash and child_entry.get("page") is None and not children:
                         del node[child_hash]
+                        self._radix_nodes.pop(child_hash, None)
                 if target_hash in node:
                     if node[target_hash].get("children"):
                         node[target_hash]["page"] = None
                     else:
                         del node[target_hash]
+                        self._radix_nodes.pop(target_hash, None)
 
     def _acquire_physical_page_id(self) -> int:
         """
@@ -219,10 +252,11 @@ class HARPCacheEngine:
             return pid
 
         # Arena is full: evict Least Recently Used (LRU) page, tie-breaking by access_count
-        lru_hash = min(
-            self.hash_to_page.keys(),
-            key=lambda k: (self.hash_to_page[k].last_accessed, self.hash_to_page[k].access_count),
+        lru_page = min(
+            self.hash_to_page.values(),
+            key=lambda p: (p.last_accessed, p.access_count),
         )
+        lru_hash = lru_page.page_hash
         self._prune_radix_hash(self.radix_root, lru_hash)
         evicted_page = self.hash_to_page.pop(lru_hash)
         self.evictions += 1
@@ -292,6 +326,7 @@ class HARPCacheEngine:
 
         with self.lock:
             radix_cursor = self.radix_root
+            parent_hash: Optional[int] = None
             rolling_hash = self.fingerprint_seed
             while curr_offset + self.PAGE_TOKENS <= n_tokens:
                 chunk = token_stream[curr_offset : curr_offset + self.PAGE_TOKENS]
@@ -335,10 +370,14 @@ class HARPCacheEngine:
                     new_pages += 1
 
                 if h not in radix_cursor:
-                    radix_cursor[h] = {"page": page, "children": {}}
+                    entry = {"page": page, "children": {}}
+                    radix_cursor[h] = entry
                 else:
-                    radix_cursor[h]["page"] = page
-                radix_cursor = radix_cursor[h]["children"]
+                    entry = radix_cursor[h]
+                    entry["page"] = page
+                self._radix_nodes[h] = (parent_hash, radix_cursor, entry)
+                parent_hash = h
+                radix_cursor = entry["children"]
 
                 curr_offset += self.PAGE_TOKENS
 
