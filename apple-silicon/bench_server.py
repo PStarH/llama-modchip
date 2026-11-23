@@ -14,7 +14,9 @@ so each prefill number is a cold prefill.
 import argparse
 import json
 import pathlib
+import sys
 import time
+import urllib.error
 import urllib.request
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -56,8 +58,13 @@ def run_one(base: str, prompt: str, max_tokens: int) -> dict:
         headers={"Content-Type": "application/json"},
     )
     t0 = time.perf_counter()
-    with urllib.request.urlopen(req, timeout=1800) as resp:
-        body = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=1800) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError as e:
+        print(f"Error: Cannot connect to llama-server at {base}: {e.reason}", file=sys.stderr)
+        print("Please ensure llama-server is running (e.g. ./apple-silicon/run-server.sh).", file=sys.stderr)
+        raise SystemExit(1)
     wall = time.perf_counter() - t0
     t = body.get("timings", {})
     return {

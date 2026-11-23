@@ -10,7 +10,9 @@ prompt tokens that llama-server took from its cache (cache_read_input_tokens).
 import argparse
 import json
 import pathlib
+import sys
 import time
+import urllib.error
 import urllib.request
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -52,29 +54,34 @@ def stream_turn(base: str, body: dict) -> dict:
     usage = {}
     blocks = {}
     stop_reason = None
-    with urllib.request.urlopen(req, timeout=1800) as resp:
-        for raw in resp:
-            line = raw.decode("utf-8").strip()
-            if not line.startswith("data: "):
-                continue
-            ev = json.loads(line[6:])
-            t = ev.get("type")
-            if t == "message_start":
-                usage.update(ev["message"].get("usage", {}))
-            elif t == "content_block_start":
-                if ttft is None:
-                    ttft = time.perf_counter() - t0
-                blocks[ev["index"]] = dict(ev["content_block"], _json="")
-            elif t == "content_block_delta":
-                b = blocks.setdefault(ev["index"], {"type": "text", "text": "", "_json": ""})
-                d = ev["delta"]
-                if d.get("type") == "text_delta":
-                    b["text"] = b.get("text", "") + d["text"]
-                elif d.get("type") == "input_json_delta":
-                    b["_json"] += d["partial_json"]
-            elif t == "message_delta":
-                usage.update(ev.get("usage", {}))
-                stop_reason = ev.get("delta", {}).get("stop_reason", stop_reason)
+    try:
+        with urllib.request.urlopen(req, timeout=1800) as resp:
+            for raw in resp:
+                line = raw.decode("utf-8").strip()
+                if not line.startswith("data: "):
+                    continue
+                ev = json.loads(line[6:])
+                t = ev.get("type")
+                if t == "message_start":
+                    usage.update(ev["message"].get("usage", {}))
+                elif t == "content_block_start":
+                    if ttft is None:
+                        ttft = time.perf_counter() - t0
+                    blocks[ev["index"]] = dict(ev["content_block"], _json="")
+                elif t == "content_block_delta":
+                    b = blocks.setdefault(ev["index"], {"type": "text", "text": "", "_json": ""})
+                    d = ev["delta"]
+                    if d.get("type") == "text_delta":
+                        b["text"] = b.get("text", "") + d["text"]
+                    elif d.get("type") == "input_json_delta":
+                        b["_json"] += d["partial_json"]
+                elif t == "message_delta":
+                    usage.update(ev.get("usage", {}))
+                    stop_reason = ev.get("delta", {}).get("stop_reason", stop_reason)
+    except urllib.error.URLError as e:
+        print(f"Error: Cannot connect to server/gateway at {base}: {e.reason}", file=sys.stderr)
+        print("Please ensure the service is running (e.g. ./apple-silicon/run-server.sh or ./apple-silicon/run-gateway.sh).", file=sys.stderr)
+        raise SystemExit(1)
     content = []
     for i in sorted(blocks):
         b = blocks[i]

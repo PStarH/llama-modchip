@@ -688,8 +688,8 @@ class ThinkBlockFilter:
 
         while self.buf:
             if self.state == "INIT":
-                while self.buf and self.buf[0] in " \t\r\n":
-                    self.buf = self.buf[1:]
+                if self.buf:
+                    self.buf = self.buf.lstrip(" \t\r\n")
                 if not self.buf:
                     break
 
