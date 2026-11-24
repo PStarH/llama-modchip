@@ -189,6 +189,26 @@ class HARPCacheEngine:
         unique_tokens = len(set(tokens))
         return float(unique_tokens) / float(len(tokens))
 
+    def _rebuild_multi_depth_hashes(self) -> None:
+        """Recompute the multi-depth hash set from the current Radix Tree.
+
+        A tombstone node (page=None, children={}) can be removed while an
+        *active* page with the same hash still exists at another depth (the
+        page has not been evicted yet). Blindly discarding the hash from
+        `_multi_depth_hashes` at deletion time would then make a later LRU
+        eviction take the O(1) path and leave a stale page behind. Rebuilding
+        from the tree after a full scan keeps the index exact.
+        """
+        seen: Dict[int, int] = {}
+        stack: List[Dict[int, Dict[str, Any]]] = [self.radix_root]
+        while stack:
+            node = stack.pop()
+            for h, entry in node.items():
+                seen[h] = seen.get(h, 0) + 1
+                if entry.get("children"):
+                    stack.append(entry["children"])
+        self._multi_depth_hashes = {h for h, n in seen.items() if n >= 2}
+
     def _prune_radix_hash(self, root_node: Dict[int, Dict[str, Any]], target_hash: int, force_full_scan: bool = False) -> None:
         """
         Removes an evicted page_hash from the Radix Tree in O(1) / O(depth) time without
@@ -247,16 +267,17 @@ class HARPCacheEngine:
                     if child_hash != target_hash and child_entry.get("page") is None and not children:
                         del node[child_hash]
                         self._radix_nodes.pop(child_hash, None)
-                        self._multi_depth_hashes.discard(child_hash)
                 if target_hash in node:
                     if node[target_hash].get("children"):
                         node[target_hash]["page"] = None
                     else:
                         del node[target_hash]
                         self._radix_nodes.pop(target_hash, None)
-                        self._multi_depth_hashes.discard(target_hash)
 
-        self._multi_depth_hashes.discard(target_hash)
+        # The scan may have removed tombstone nodes belonging to OTHER hashes
+        # that are still multi-depth, so recompute the index from the tree.
+        if root_node is self.radix_root:
+            self._rebuild_multi_depth_hashes()
 
     def _acquire_physical_page_id(self) -> int:
         """

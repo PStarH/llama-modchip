@@ -287,5 +287,38 @@ class TestHARPCache(unittest.TestCase):
                 os.remove(shm)
 
 
+    def test_multi_depth_marker_matches_radix_tree_after_prune(self):
+        """`_multi_depth_hashes` must stay in sync with the tree after a full scan."""
+        import kv_cache.harp_cache as harp_mod
+        shm = f"/dev/shm/harp_kv_cache_test_marker_{_UID}.bin"
+        original = harp_mod.hash_token_block
+        block_a = [1000 + i for i in range(32)]
+        harp_mod.hash_token_block = lambda tokens, prev_hash=harp_mod.FNV_OFFSET_BASIS: (
+            999 if list(tokens) == block_a else original(tokens, prev_hash=prev_hash)
+        )
+        engine = HARPCacheEngine(shm_path=shm, max_pages=8)
+        try:
+            engine.store_prefix(block_a + block_a)
+            self.assertIn(999, engine._multi_depth_hashes)
+            # A full scan of an unrelated hash must not corrupt the marker.
+            engine._prune_radix_hash(engine.radix_root, 888, force_full_scan=True)
+
+            counts: dict = {}
+
+            def walk(node):
+                for h, entry in node.items():
+                    counts[h] = counts.get(h, 0) + 1
+                    walk(entry["children"])
+
+            walk(engine.radix_root)
+            expected = {h for h, n in counts.items() if n >= 2}
+            self.assertEqual(engine._multi_depth_hashes, expected)
+        finally:
+            harp_mod.hash_token_block = original
+            engine.close()
+            if os.path.exists(shm):
+                os.remove(shm)
+
+
 if __name__ == "__main__":
     unittest.main()
