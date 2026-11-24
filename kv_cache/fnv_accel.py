@@ -15,6 +15,7 @@ import ctypes
 import hashlib
 import os
 import shutil
+import stat
 import struct
 import subprocess
 import tempfile
@@ -80,12 +81,41 @@ _LIB_PATH = Path(__file__).resolve().parent / _LIB_NAME
 
 
 def _fallback_dir() -> Path:
-    """Per-user cache directory used when the source directory is read-only."""
+    """Private per-user cache directory used when the source dir is read-only.
+
+    The leaf directory is created with mode 0700 and validated on load, so a
+    different local user cannot plant a symlink or a poisoned .so here.
+    """
     try:
         uid = os.getuid()  # not available on Windows
     except AttributeError:
         uid = "default"
-    return Path(tempfile.gettempdir()) / f"modchip-fnv-{uid}"
+    return Path(tempfile.gettempdir()) / f"modchip-fnv-{uid}" / "cache"
+
+
+def _trusted_dir(path: Path) -> bool:
+    """Reject a cache directory that is a symlink or writable by others.
+
+    Both the primary (next to the source) and the fallback location are
+    checked.  A world/group-WRITABLE directory would let another local user
+    replace the artifact with a library that passes the version check but
+    returns wrong hashes, silently poisoning HARP-Cache lookups.  Read and
+    execute bits are fine — the source directory is usually 0755.
+    """
+    try:
+        st = path.lstat()  # do not follow a symlink
+        if not stat.S_ISDIR(st.st_mode):
+            return False
+        if st.st_mode & 0o022:  # group- or world-writable
+            return False
+        try:
+            if st.st_uid != os.getuid():
+                return False
+        except AttributeError:  # Windows
+            pass
+        return True
+    except OSError:
+        return False
 
 
 def _candidate_paths() -> list:
@@ -115,12 +145,28 @@ def _bind(lib) -> tuple:
     return fn, chain, ver
 
 
-def _probe(fn) -> bool:
-    """Verify bit-identity against the reference implementation."""
+def _probe(fn_native) -> bool:
+    """Verify bit-identity of BOTH native functions against the reference.
+
+    Checking only the scalar hash is not enough: a poisoned artifact could
+    implement `modchip_fnv1a_64` correctly and return garbage from
+    `modchip_fnv_chain`, which is what the HARP hot path actually uses.
+    """
     probe = bytes(range(256))
+    tokens = [0, 1, -1, 2**31 - 1, -(2**31)] * 8  # 40 tokens -> 1 full block
     try:
-        return fn(probe, len(probe), FNV_OFFSET_BASIS) == _fnv1a_python(probe)
-    except (OSError, ValueError, ctypes.ArgumentError):
+        for seed in (FNV_OFFSET_BASIS, 0, 0xFFFFFFFFFFFFFFFF):
+            if fn_native[0](probe, len(probe), seed) != _fnv1a_python(probe, seed):
+                return False
+        raw = struct.Struct(f"<{len(tokens)}i").pack(*tokens)
+        buf = bytearray(8)
+        out = (_U64 * 1).from_buffer(buf)
+        written = fn_native[1](raw, len(raw), 8, FNV_OFFSET_BASIS, out, 1)
+        expected = FNV_OFFSET_BASIS
+        for i in range(0, 8 * 4):
+            expected = ((expected ^ raw[i]) * FNV_PRIME) & MASK_64
+        return written == 1 and out[0] == expected
+    except (OSError, ValueError, ctypes.ArgumentError, struct.error):
         return False
 
 
@@ -132,8 +178,13 @@ def _load_cached() -> Optional[tuple]:
     silently falling back to the slow Python path.
     """
     for path in _candidate_paths():
+        if not _trusted_dir(path.parent):
+            continue
         try:
             if not path.exists():
+                continue
+            if path.is_symlink():
+                _discard_cached(path)
                 continue
             lib = ctypes.CDLL(str(path))
             fn = _bind(lib)
@@ -146,7 +197,7 @@ def _load_cached() -> Optional[tuple]:
         except (OSError, ValueError):
             _discard_cached(path)
             continue
-        if not _probe(fn[0]):
+        if not _probe(fn):
             _discard_cached(path)
             continue
         return fn
@@ -185,7 +236,12 @@ def _install(so: Path) -> Optional[Path]:
     """
     for target_dir in (_LIB_PATH.parent, _fallback_dir()):
         try:
-            target_dir.mkdir(parents=True, exist_ok=True)
+            target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if not _trusted_dir(target_dir):
+                # A symlinked or world/group-writable cache directory could
+                # redirect the artifact somewhere another local user
+                # controls.  Refuse rather than write through it.
+                continue
             fd, tmp_name = tempfile.mkstemp(prefix=".fnv_accel-",
                                             suffix=".so",
                                             dir=str(target_dir))
@@ -240,7 +296,7 @@ def _compile_and_load() -> Optional[tuple]:
                 fn = _bind(ctypes.CDLL(str(persistent)))
             except (OSError, ValueError, AttributeError, ctypes.ArgumentError):
                 return None
-            if not _probe(fn[0]):
+            if not _probe(fn):
                 return None
             return fn
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -255,7 +311,7 @@ def _load_native() -> Optional[tuple]:
     if fn is None:
         return None
     # Final bit-identity check before the fast path is trusted.
-    if not _probe(fn[0]):
+    if not _probe(fn):
         return None
     return fn
 

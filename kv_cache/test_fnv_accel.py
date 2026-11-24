@@ -41,6 +41,16 @@ class NativeFNVTest(unittest.TestCase):
         # FNV-1a 64-bit of ASCII "a" is a published test vector.
         self.assertEqual(fnv1a_64(b"a"), 0xAF63DC4C8601EC8C)
 
+    def test_hash_token_block_non_32_token_branch(self):
+        """The fallback branch for partial blocks must still hash correctly."""
+        import struct as _struct
+
+        seed = 0x123456789ABCDEF
+        self.assertEqual(
+            hash_token_block([1, 2, 3], prev_hash=seed),
+            fnv1a_64(_struct.pack("<3i", 1, 2, 3), seed),
+        )
+
     def test_hash_token_block_chain_unchanged(self):
         """Causal chaining via prev_hash must produce identical results."""
         block = [1000 + i for i in range(32)]
@@ -150,6 +160,110 @@ class NativeFNVTest(unittest.TestCase):
             self.assertIsNone(harp_mod._hash_chain([1] * 64, 32, FNV_OFFSET_BASIS))
         finally:
             harp_mod.hash_token_block = original
+
+    def test_batched_chain_collision_rejects_wrong_tokens(self):
+        """A same-hash/different-token block must NOT be a cache hit.
+
+        The existing collision tests monkeypatch `hash_token_block`, which
+        deliberately disables the batched path — so they never exercise the
+        bytes-compare collision check.  Here we patch the batched chain
+        itself, leaving `hash_token_block` intact so the native path stays
+        live.  Without the bytes comparison this would silently return
+        another block's KV data, which is a causal/RoPE soundness violation.
+        """
+        if fnv_accel._native is None:
+            self.skipTest("no C compiler available on this host")
+        import kv_cache.harp_cache as harp_mod
+
+        import kv_cache.fnv_accel as accel_mod
+
+        def constant_chain(tokens, block, seed):
+            hashes, packed = real_chain(tokens, block, seed)
+            return [999] * len(hashes), packed
+
+        real_chain = accel_mod.fnv_chain_blocks_with_bytes
+        original = harp_mod.fnv_chain_blocks_with_bytes
+        original_sentinel = harp_mod._ORIGINAL_FNV_CHAIN_BLOCKS_WITH_BYTES
+        # Patch the function AND the guard sentinel together: this simulates a
+        # genuine 64-bit collision in the native chain, which the guard cannot
+        # distinguish from an unchanged primitive.
+        harp_mod.fnv_chain_blocks_with_bytes = constant_chain
+        harp_mod._ORIGINAL_FNV_CHAIN_BLOCKS_WITH_BYTES = constant_chain
+        try:
+            engine = harp_mod.HARPCacheEngine(max_pages=64)
+            block_a = [1] * 32
+            block_b = [2] * 32
+            engine.store_prefix(block_a)
+            cached, pages, suffix = engine.resolve_prefix(block_b)
+            self.assertEqual(cached, 0, "colliding block must not be a hit")
+            self.assertEqual(pages, [])
+            self.assertEqual(suffix, block_b)
+        finally:
+            harp_mod.fnv_chain_blocks_with_bytes = original
+            harp_mod._ORIGINAL_FNV_CHAIN_BLOCKS_WITH_BYTES = original_sentinel
+
+    def test_batched_chain_collision_eviction_recycles_correct_bytes(self):
+        """When a collision evicts a page, the new page must carry its OWN
+        token bytes, not the evicted page's."""
+        if fnv_accel._native is None:
+            self.skipTest("no C compiler available on this host")
+        import kv_cache.harp_cache as harp_mod
+
+        import kv_cache.fnv_accel as accel_mod
+
+        def constant_chain(tokens, block, seed):
+            hashes, packed = real_chain(tokens, block, seed)
+            return [999] * len(hashes), packed
+
+        real_chain = accel_mod.fnv_chain_blocks_with_bytes
+        original = harp_mod.fnv_chain_blocks_with_bytes
+        original_sentinel = harp_mod._ORIGINAL_FNV_CHAIN_BLOCKS_WITH_BYTES
+        harp_mod.fnv_chain_blocks_with_bytes = constant_chain
+        harp_mod._ORIGINAL_FNV_CHAIN_BLOCKS_WITH_BYTES = constant_chain
+        try:
+            engine = harp_mod.HARPCacheEngine(max_pages=4)
+            block_a = [1] * 32
+            block_b = [2] * 32
+            engine.store_prefix(block_a + block_a + block_b)
+            page = engine.hash_to_page[999]
+            self.assertEqual(page.tokens, block_b)
+            self.assertEqual(page.token_bytes, harp_mod._pack_tokens(block_b))
+            cached, pages, _ = engine.resolve_prefix(block_b)
+            self.assertEqual(cached, 32)
+            self.assertEqual(pages[0].tokens, block_b)
+        finally:
+            harp_mod.fnv_chain_blocks_with_bytes = original
+            harp_mod._ORIGINAL_FNV_CHAIN_BLOCKS_WITH_BYTES = original_sentinel
+
+    def test_batched_chain_disabled_when_fnv_primitive_is_patched(self):
+        """Patching the hash PRIMITIVE must disable the batched path too.
+
+        The original guard only checked `hash_token_block`, so a test or
+        caller that patched `fnv1a_64` to force collisions still got real
+        hashes from the native chain — the injected collision was silently
+        ignored.  All hash primitives are now guarded.
+        """
+        import kv_cache.harp_cache as harp_mod
+
+        if not harp_mod._hash_primitives_intact():
+            self.skipTest("hash primitives already patched by another test")
+        original = harp_mod.fnv1a_64
+        try:
+            harp_mod.fnv1a_64 = lambda data, seed=harp_mod.FNV_OFFSET_BASIS: 999
+            tokens = [1] * 64
+            self.assertIsNone(harp_mod._hash_chain(tokens, 32,
+                                                   harp_mod.FNV_OFFSET_BASIS))
+            self.assertEqual(
+                harp_mod._hash_chain_with_bytes(tokens, 32,
+                                                harp_mod.FNV_OFFSET_BASIS),
+                (None, None),
+            )
+            # And an actual engine must honour the patch.
+            engine = harp_mod.HARPCacheEngine(max_pages=8)
+            engine.store_prefix(tokens)
+            self.assertEqual(list(engine.hash_to_page), [999])
+        finally:
+            harp_mod.fnv1a_64 = original
 
     def test_bytes_compare_matches_list_compare(self):
         """The radix walk's bytes-compare path must be semantically identical
@@ -279,9 +393,9 @@ class NativeFNVTest(unittest.TestCase):
 
         # And the artifact on disk must load and hash correctly.
         lib = ctypes.CDLL(str(fnv_accel._LIB_PATH))
-        fn, chain, ver = fnv_accel._bind(lib)
-        self.assertEqual(ver(), fnv_accel._version_number())
-        self.assertTrue(fnv_accel._probe(fn))
+        bound = fnv_accel._bind(lib)
+        self.assertEqual(bound[2](), fnv_accel._version_number())
+        self.assertTrue(fnv_accel._probe(bound))
 
 
 if __name__ == "__main__":

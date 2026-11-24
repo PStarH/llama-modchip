@@ -89,10 +89,25 @@ def hash_token_block(tokens: List[int], prev_hash: int = FNV_OFFSET_BASIS) -> in
     return fnv1a_64(raw, seed=prev_hash)
 
 
-# The batched native chain is only equivalent to `hash_token_block` while that
-# function is the original implementation. Tests monkeypatch it to force hash
-# collisions, so the batched path must be disabled as soon as it is replaced.
+# The batched native chain is only equivalent to `hash_token_block` while the
+# hash primitives are the original implementations.  Tests monkeypatch them to
+# force hash collisions, so the batched path must be disabled as soon as any
+# of them is replaced: patching only `hash_token_block` would leave the
+# batched path live and the injected collision would be silently ignored.
 _ORIGINAL_HASH_TOKEN_BLOCK = hash_token_block
+_ORIGINAL_FNV1A_64 = fnv1a_64
+_ORIGINAL_FNV_CHAIN_BLOCKS = fnv_chain_blocks
+_ORIGINAL_FNV_CHAIN_BLOCKS_WITH_BYTES = fnv_chain_blocks_with_bytes
+
+
+def _hash_primitives_intact() -> bool:
+    """True while every hash primitive is the original implementation."""
+    return (
+        hash_token_block is _ORIGINAL_HASH_TOKEN_BLOCK
+        and fnv1a_64 is _ORIGINAL_FNV1A_64
+        and fnv_chain_blocks is _ORIGINAL_FNV_CHAIN_BLOCKS
+        and fnv_chain_blocks_with_bytes is _ORIGINAL_FNV_CHAIN_BLOCKS_WITH_BYTES
+    )
 
 
 def _hash_chain(tokens: List[int], block: int, seed: int) -> Optional[List[int]]:
@@ -101,7 +116,7 @@ def _hash_chain(tokens: List[int], block: int, seed: int) -> Optional[List[int]]
     Returns None when the batched native path is unavailable or would not match
     `hash_token_block`, so callers fall back to the per-block path.
     """
-    if hash_token_block is not _ORIGINAL_HASH_TOKEN_BLOCK:
+    if not _hash_primitives_intact():
         return None
     return fnv_chain_blocks(tokens, block, seed)
 
@@ -114,7 +129,7 @@ def _hash_chain_with_bytes(
     Returns (None, None) when the batched native path is unavailable or would
     not match `hash_token_block`, so callers fall back to the per-block path.
     """
-    if hash_token_block is not _ORIGINAL_HASH_TOKEN_BLOCK:
+    if not _hash_primitives_intact():
         return None, None
     return fnv_chain_blocks_with_bytes(tokens, block, seed)
 
