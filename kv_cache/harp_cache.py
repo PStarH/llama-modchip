@@ -38,9 +38,9 @@ MASK_64 = 0xffffffffffffffff
 _STRUCT_32I = struct.Struct("<32i")
 
 try:
-    from kv_cache.fnv_accel import fnv1a_64 as _FNV_IMPL
+    from kv_cache.fnv_accel import fnv1a_64 as _FNV_IMPL, fnv_chain_blocks
 except ImportError:  # pragma: no cover - standalone `from harp_cache import ...`
-    from fnv_accel import fnv1a_64 as _FNV_IMPL
+    from fnv_accel import fnv1a_64 as _FNV_IMPL, fnv_chain_blocks
 
 
 def fnv1a_64(data: bytes, seed: int = FNV_OFFSET_BASIS) -> int:
@@ -62,6 +62,23 @@ def hash_token_block(tokens: List[int], prev_hash: int = FNV_OFFSET_BASIS) -> in
     else:
         raw = struct.pack(f"<{len(tokens)}i", *tokens)
     return fnv1a_64(raw, seed=prev_hash)
+
+
+# The batched native chain is only equivalent to `hash_token_block` while that
+# function is the original implementation. Tests monkeypatch it to force hash
+# collisions, so the batched path must be disabled as soon as it is replaced.
+_ORIGINAL_HASH_TOKEN_BLOCK = hash_token_block
+
+
+def _hash_chain(tokens: List[int], block: int, seed: int) -> Optional[List[int]]:
+    """Chained hashes for every full `block`-sized chunk of `tokens`.
+
+    Returns None when the batched native path is unavailable or would not match
+    `hash_token_block`, so callers fall back to the per-block path.
+    """
+    if hash_token_block is not _ORIGINAL_HASH_TOKEN_BLOCK:
+        return None
+    return fnv_chain_blocks(tokens, block, seed)
 
 
 class HARPPage:
@@ -293,6 +310,17 @@ class HARPCacheEngine:
         self.evictions += 1
         return evicted_page.page_id
 
+    def _chain_hashes(self, token_stream: List[int], seed: int) -> Optional[List[int]]:
+        """Chained FNV-1a hashes for every full PAGE_TOKENS block of `token_stream`.
+
+        Returns None when the native batched implementation is unavailable, in
+        which case callers fall back to the per-block `hash_token_block` path.
+        """
+        hashes = _hash_chain(token_stream, self.PAGE_TOKENS, seed)
+        if hashes is None or len(hashes) != len(token_stream) // self.PAGE_TOKENS:
+            return None
+        return hashes
+
     def resolve_prefix(self, token_stream: List[int]) -> Tuple[int, List[HARPPage], List[int]]:
         """
         Causally Sound Longest Common Prefix (LCP) Resolver.
@@ -309,10 +337,18 @@ class HARPCacheEngine:
         with self.lock:
             radix_cursor: Optional[Dict[int, Dict[str, Any]]] = self.radix_root
             rolling_hash = self.fingerprint_seed
+            # Hash the whole chain in one native call when possible; the walk
+            # below still stops at the first block that does not match.
+            chain = self._chain_hashes(token_stream, rolling_hash)
+            block_index = 0
             while curr_offset + self.PAGE_TOKENS <= n_tokens:
                 chunk = token_stream[curr_offset : curr_offset + self.PAGE_TOKENS]
-                rolling_hash = hash_token_block(chunk, prev_hash=rolling_hash)
-                h = rolling_hash
+                if chain is not None:
+                    h = chain[block_index]
+                else:
+                    rolling_hash = hash_token_block(chunk, prev_hash=rolling_hash)
+                    h = rolling_hash
+                block_index += 1
 
                 page: Optional[HARPPage] = None
                 if radix_cursor is not None and h in radix_cursor:
@@ -359,10 +395,17 @@ class HARPCacheEngine:
             radix_cursor = self.radix_root
             parent_hash: Optional[int] = None
             rolling_hash = self.fingerprint_seed
+            # Hash the whole chain in one native call when possible.
+            chain = self._chain_hashes(token_stream, rolling_hash)
+            block_index = 0
             while curr_offset + self.PAGE_TOKENS <= n_tokens:
                 chunk = token_stream[curr_offset : curr_offset + self.PAGE_TOKENS]
-                rolling_hash = hash_token_block(chunk, prev_hash=rolling_hash)
-                h = rolling_hash
+                if chain is not None:
+                    h = chain[block_index]
+                else:
+                    rolling_hash = hash_token_block(chunk, prev_hash=rolling_hash)
+                    h = rolling_hash
+                block_index += 1
 
                 existing = self.hash_to_page.get(h)
                 if existing is not None and existing.tokens == chunk:
