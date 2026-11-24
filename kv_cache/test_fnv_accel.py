@@ -94,17 +94,19 @@ class NativeFNVTest(unittest.TestCase):
             self.assertEqual(fnv_accel.fnv_chain_blocks(with_tail, 32, seed),
                              expected)
 
-    def test_batched_chain_survives_out_of_range_token(self):
-        """Tokens outside int32 range must not crash the batched path."""
+    def test_batched_chain_rejects_out_of_range_token(self):
+        """A token outside int32 range must fall back, never silently encode.
+
+        Real token IDs are always small, but if an invalid value slips through
+        the batched path must return None so the caller uses hash_token_block,
+        which raises rather than producing a hash llama.cpp cannot reproduce.
+        """
         if fnv_accel._native is None:
             self.skipTest("no C compiler available on this host")
-        tokens = [1] * 32 + [2**40]
-        # The out-of-range token sits in the trailing partial block, which is
-        # dropped, so the completed block's hash is unaffected.
-        got = fnv_accel.fnv_chain_blocks(tokens, 32)
-        self.assertEqual(len(got), 1)
-        expected = fnv1a_64(struct.pack("<32i", *tokens[:32]))
-        self.assertEqual(got, [expected])
+        for tokens in ([1] * 32 + [2**40], [1] * 32 + [2**40] + [2] * 31):
+            self.assertIsNone(fnv_accel.fnv_chain_blocks(tokens, 32))
+            self.assertIsNone(
+                fnv_accel.fnv_chain_blocks_with_bytes(tokens, 32)[0])
 
     def test_batched_chain_is_actually_used(self):
         """The batched path must be live, not silently falling back.

@@ -264,26 +264,20 @@ def fnv1a_64(data: bytes, seed: int = FNV_OFFSET_BASIS) -> int:
     return _fnv1a_python(data, seed)
 
 
-def _pack_int32(tokens, block: int) -> bytes:
-    """Pack int32 token IDs into little-endian bytes.
+def _pack_int32(tokens) -> bytes:
+    """Pack token IDs into little-endian int32 bytes.
 
     Packs the WHOLE list rather than only the complete blocks: copying a
     32k-token slice costs ~0.08 ms, and the C side already floors the byte
     count to whole blocks, so the trailing bytes are ignored.
 
-    If a token is outside int32 range only the trailing partial block can
-    contain it (a complete block would fail the per-block fallback too), so
-    pack the complete blocks and pad the tail with zeros.  The buffer keeps
-    the same offsets either way, which the callers rely on.
+    Real token IDs are always small non-negative integers.  If a value is
+    outside int32 range, let the caller fall back to the per-block path
+    rather than guessing how to encode it — a silently zero-padded buffer
+    would produce a hash the native llama.cpp side cannot reproduce.
     """
     n = len(tokens)
-    try:
-        return struct.Struct(f"<{n}i").pack(*tokens)
-    except (struct.error, OverflowError, ValueError):
-        n_blocks = n // block
-        head = struct.Struct(f"<{n_blocks * block}i").pack(
-            *tokens[:n_blocks * block])
-        return head + b"\x00" * (n * 4 - len(head))
+    return struct.Struct(f"<{n}i").pack(*tokens)
 
 
 def fnv_chain_blocks_with_bytes(tokens, block: int, seed: int = FNV_OFFSET_BASIS):
@@ -306,7 +300,7 @@ def fnv_chain_blocks_with_bytes(tokens, block: int, seed: int = FNV_OFFSET_BASIS
     if n_blocks == 0:
         return [], b""
     try:
-        raw = _pack_int32(tokens, block)
+        raw = _pack_int32(tokens)
         buf = bytearray(8 * n_blocks)
         out = (_U64 * n_blocks).from_buffer(buf)
         _native[1](raw, len(raw), block, seed, out)
@@ -330,7 +324,7 @@ def fnv_chain_blocks(tokens, block: int, seed: int = FNV_OFFSET_BASIS):
     if n_blocks == 0:
         return []
     try:
-        raw = _pack_int32(tokens, block)
+        raw = _pack_int32(tokens)
         # The chain writes uint64 results into a byte buffer; reading them back
         # through memoryview().cast('Q').tolist() is ~2.9x faster than
         # indexing the ctypes array element by element.
