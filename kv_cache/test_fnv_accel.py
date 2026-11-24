@@ -106,6 +106,84 @@ class NativeFNVTest(unittest.TestCase):
         self.assertLess(t_native, t_py / 3,
                         f"native too slow: {t_native} vs Python {t_py}")
 
+    def test_embedded_null_bytes_hash_full_buffer(self):
+        """c_char_p must not truncate the buffer at an embedded NUL."""
+        rng = random.Random(0xFEED)
+        for _ in range(50):
+            data = bytes(rng.getrandbits(8) for _ in range(rng.randint(1, 256)))
+            data = data[:len(data)//2] + b"\x00" + data[len(data)//2:]
+            seed = rng.getrandbits(64)
+            self.assertEqual(fnv1a_64(data, seed), fnv_accel._fnv1a_python(data, seed))
+
+    def test_bytes_like_input(self):
+        """bytearray/memoryview should work just like bytes."""
+        data = b"a" * 100
+        seed = 0xDEADBEEF
+        expected = fnv1a_64(data, seed)
+        self.assertEqual(fnv1a_64(bytearray(data), seed), expected)
+        self.assertEqual(fnv1a_64(memoryview(data), seed), expected)
+
+    def test_no_compiler_falls_back_to_python(self):
+        """When no compiler is found, fnv1a_64 must still be bit-identical."""
+        from unittest import mock
+
+        with mock.patch.object(fnv_accel.shutil, "which", return_value=None):
+            with mock.patch.object(fnv_accel, "_native", None):
+                self.assertEqual(fnv1a_64(b"fallback", 12345),
+                                 fnv_accel._fnv1a_python(b"fallback", 12345))
+                raw = FNV_OFFSET_BASIS.to_bytes(8, "little")
+                self.assertEqual(fnv1a_64(raw), fnv_accel._fnv1a_python(raw))
+
+    def test_corrupt_cached_artifact_is_discarded(self):
+        """A cached .so that fails the probe must be removed, not trusted."""
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            bogus = Path(d) / "bogus.so"
+            bogus.write_bytes(b"not a shared object")
+            with mock.patch.object(fnv_accel, "_candidate_paths", return_value=[bogus]):
+                self.assertIsNone(fnv_accel._load_cached())
+            # _load_cached() removes the unusable artifact so that the next
+            # import rebuilds and replaces it.
+            self.assertFalse(bogus.exists())
+
+    def test_stale_version_artifact_is_discarded(self):
+        """A cached .so built from older source must not be used."""
+        from unittest import mock
+
+        if fnv_accel._native is None:
+            self.skipTest("no C compiler available on this host")
+        if not fnv_accel._LIB_PATH.exists():
+            self.skipTest("no cached artifact on this host")
+
+        with mock.patch.object(fnv_accel, "_version_number", return_value=0), \
+             mock.patch.object(fnv_accel, "_discard_cached") as discard:
+            self.assertIsNone(fnv_accel._load_cached())
+            discard.assert_called_once()
+
+    def test_cached_artifact_is_installed_atomically(self):
+        """The installed artifact must be a complete, loadable shared object."""
+        import ctypes
+        from unittest import mock
+
+        if fnv_accel._native is None:
+            self.skipTest("no C compiler available on this host")
+        if not fnv_accel._LIB_PATH.exists():
+            self.skipTest("no cached artifact on this host")
+
+        # No stray temporary files must be left behind by the install.
+        leftovers = list(fnv_accel._LIB_PATH.parent.glob(".fnv_accel-*.so"))
+        self.assertEqual(leftovers, [],
+                         f"stray temp artifacts: {leftovers}")
+
+        # And the artifact on disk must load and hash correctly.
+        lib = ctypes.CDLL(str(fnv_accel._LIB_PATH))
+        fn, chain, ver = fnv_accel._bind(lib)
+        self.assertEqual(ver(), fnv_accel._version_number())
+        self.assertTrue(fnv_accel._probe(fn))
+
 
 if __name__ == "__main__":
     unittest.main()
