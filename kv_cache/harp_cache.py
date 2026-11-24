@@ -37,13 +37,17 @@ MASK_64 = 0xffffffffffffffff
 
 _STRUCT_32I = struct.Struct("<32i")
 
+try:
+    from kv_cache.fnv_accel import fnv1a_64 as _FNV_IMPL
+except ImportError:  # pragma: no cover - standalone `from harp_cache import ...`
+    from fnv_accel import fnv1a_64 as _FNV_IMPL
+
 
 def fnv1a_64(data: bytes, seed: int = FNV_OFFSET_BASIS) -> int:
     """Computes high-speed 64-bit FNV-1a hash over raw byte buffer."""
-    h = seed
-    for b in data:
-        h = ((h ^ b) * FNV_PRIME) & MASK_64
-    return h
+    # Native C implementation when a compiler is available (~16x faster);
+    # bit-identical pure-Python fallback otherwise. See kv_cache/fnv_accel.py.
+    return _FNV_IMPL(data, seed)
 
 
 def hash_token_block(tokens: List[int], prev_hash: int = FNV_OFFSET_BASIS) -> int:
