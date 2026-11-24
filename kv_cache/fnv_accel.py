@@ -41,13 +41,21 @@ uint64_t modchip_fnv1a_64(const uint8_t *data, size_t n, uint64_t seed) {
 
 /* Chained FNV-1a over fixed-size blocks of little-endian int32 tokens packed
  * into a byte buffer.  out[k] = FNV64(seed || block_0 || ... || block_k);
- * returns the block count.  Equivalent to calling modchip_fnv1a_64 on each
- * block's 4*block bytes with the previous block's hash as seed. */
+ * returns the number of hashes written.  Equivalent to calling
+ * modchip_fnv1a_64 on each block's 4*block bytes with the previous block's
+ * hash as seed.
+ *
+ * `out_cap` is the number of uint64 slots in `out`; the function never writes
+ * more than that.  Passing a capacity smaller than the number of blocks
+ * truncates the chain rather than overflowing the buffer. */
 size_t modchip_fnv_chain(const uint8_t *data, size_t nbytes,
-                          size_t block, uint64_t seed, uint64_t *out) {
+                          size_t block, uint64_t seed,
+                          uint64_t *out, size_t out_cap) {
+    if (block == 0 || out == NULL) return 0;
     size_t nblocks = nbytes / (block * 4), k = 0;
     uint64_t h = seed;
     for (size_t b = 0; b < nblocks; b++) {
+        if (k >= out_cap) break;
         const uint8_t *p = data + b * block * 4;
         for (size_t i = 0; i < block * 4; i++) {
             h = (h ^ p[i]) * UINT64_C(1099511628211);
@@ -99,7 +107,7 @@ def _bind(lib) -> tuple:
     chain = lib.modchip_fnv_chain
     chain.argtypes = [ctypes.c_char_p, ctypes.c_size_t,
                       ctypes.c_size_t, _U64,
-                      ctypes.POINTER(_U64)]
+                      ctypes.POINTER(_U64), ctypes.c_size_t]
     chain.restype = ctypes.c_size_t
     ver = lib.modchip_fnv_version
     ver.argtypes = []
@@ -303,7 +311,7 @@ def fnv_chain_blocks_with_bytes(tokens, block: int, seed: int = FNV_OFFSET_BASIS
         raw = _pack_int32(tokens)
         buf = bytearray(8 * n_blocks)
         out = (_U64 * n_blocks).from_buffer(buf)
-        _native[1](raw, len(raw), block, seed, out)
+        _native[1](raw, len(raw), block, seed, out, n_blocks)
         return memoryview(buf).cast("Q").tolist(), raw
     except (ValueError, TypeError, OverflowError, MemoryError, struct.error):
         return None, None
@@ -330,7 +338,7 @@ def fnv_chain_blocks(tokens, block: int, seed: int = FNV_OFFSET_BASIS):
         # indexing the ctypes array element by element.
         buf = bytearray(8 * n_blocks)
         out = (_U64 * n_blocks).from_buffer(buf)
-        _native[1](raw, len(raw), block, seed, out)
+        _native[1](raw, len(raw), block, seed, out, n_blocks)
         return memoryview(buf).cast("Q").tolist()
     except (ValueError, TypeError, OverflowError, MemoryError, struct.error):
         return None
