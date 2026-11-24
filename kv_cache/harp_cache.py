@@ -27,7 +27,7 @@ import time
 import mmap
 import struct
 import threading
-from typing import List, Tuple, Dict, Optional, Any
+from typing import List, Tuple, Dict, Optional, Any, Set
 
 # FNV-1a 64-bit constants
 FNV_OFFSET_BASIS = 0xcbf29ce484222325
@@ -121,6 +121,13 @@ class HARPCacheEngine:
         self.radix_root: Dict[int, Dict[str, Any]] = {}
         # Fast parent index: chained_hash -> (parent_hash, parent_dict, entry_dict)
         self._radix_nodes: Dict[int, Tuple[Optional[int], Dict[int, Dict[str, Any]], Dict[str, Any]]] = {}
+        # Hashes that occupy MORE THAN ONE depth in the Radix Tree. `_radix_nodes` is
+        # keyed by hash alone, so a hash stored at several depths only remembers its
+        # deepest parent link; pruning it via the O(1) fast path would leave the outer
+        # node still holding a page that was already evicted and whose physical slot has
+        # been recycled. Multi-depth hashes are routed through the bottom-up full scan
+        # instead, on BOTH the collision path and the LRU eviction path.
+        self._multi_depth_hashes: Set[int] = set()
 
         # Physical page allocator (monotonic watermark + recycled free-list)
         self.allocated_pages = 0
@@ -192,10 +199,12 @@ class HARPCacheEngine:
         - Only deletes from `parent_dict` when `"children"` is empty, propagating pruning upward.
         - Falls back to stack-based bottom-up traversal if target_hash is not in `_radix_nodes`.
 
-        `force_full_scan=True` removes EVERY node keyed by `target_hash` at any depth. It is
-        required for the 64-bit hash-collision path: `_radix_nodes` is keyed by hash alone, so
-        when the same hash occurs at several depths only the deepest parent link is recorded.
-        The O(1) fast path would then prune just that one node and leave an outer node still
+        `force_full_scan=True` skips the O(1) branch and falls straight through to the
+        existing bottom-up pass, which removes EVERY node keyed by `target_hash` at any
+        depth and cleans up ancestors that become empty as a result. This is required for
+        the 64-bit hash-collision path: `_radix_nodes` is keyed by hash alone, so when the
+        same hash occurs at several depths only the deepest parent link is recorded.
+        The O(1) fast path would prune just that one node and leave an outer node still
         holding a page that was already evicted and whose physical slot has been recycled.
         """
         if not force_full_scan and root_node is self.radix_root and target_hash in self._radix_nodes:
@@ -220,32 +229,9 @@ class HARPCacheEngine:
                     break
             return
 
-        if force_full_scan:
-            # Remove EVERY node keyed by `target_hash` at any depth. Nodes that still own
-            # descendants keep their subtree reachable but drop the stale page reference.
-            stack = [root_node]
-            while stack:
-                node = stack.pop()
-                for child_hash, child_entry in list(node.items()):
-                    if child_hash == target_hash:
-                        children = child_entry.get("children")
-                        if children:
-                            child_entry["page"] = None
-                        else:
-                            del node[child_hash]
-                            self._radix_nodes.pop(child_hash, None)
-                            continue
-                    else:
-                        children = child_entry.get("children")
-                        if child_entry.get("page") is None and not children:
-                            del node[child_hash]
-                            self._radix_nodes.pop(child_hash, None)
-                            continue
-                    if children:
-                        stack.append(children)
-            return
-
-        # Stack-based bottom-up traversal fallback (for external callers or untracked nodes)
+        # Stack-based bottom-up traversal: removes the target at EVERY depth and
+        # cleans up any ancestor that becomes empty. Forced for multi-depth hashes
+        # (collision or LRU eviction) so no stale page reference survives.
         stack: List[Tuple[Dict[int, Dict[str, Any]], bool]] = [(root_node, False)]
         while stack:
             node, visited_children = stack.pop()
@@ -261,12 +247,16 @@ class HARPCacheEngine:
                     if child_hash != target_hash and child_entry.get("page") is None and not children:
                         del node[child_hash]
                         self._radix_nodes.pop(child_hash, None)
+                        self._multi_depth_hashes.discard(child_hash)
                 if target_hash in node:
                     if node[target_hash].get("children"):
                         node[target_hash]["page"] = None
                     else:
                         del node[target_hash]
                         self._radix_nodes.pop(target_hash, None)
+                        self._multi_depth_hashes.discard(target_hash)
+
+        self._multi_depth_hashes.discard(target_hash)
 
     def _acquire_physical_page_id(self) -> int:
         """
@@ -288,7 +278,13 @@ class HARPCacheEngine:
             key=lambda p: (p.last_accessed, p.access_count),
         )
         lru_hash = lru_page.page_hash
-        self._prune_radix_hash(self.radix_root, lru_hash)
+        # Multi-depth hashes need the full bottom-up scan: `_radix_nodes` only tracks
+        # the deepest parent, so the O(1) path would leave outer nodes holding the
+        # evicted page while its physical slot is recycled for another block.
+        self._prune_radix_hash(
+            self.radix_root, lru_hash,
+            force_full_scan=lru_hash in self._multi_depth_hashes,
+        )
         evicted_page = self.hash_to_page.pop(lru_hash)
         self.evictions += 1
         return evicted_page.page_id
@@ -410,6 +406,11 @@ class HARPCacheEngine:
                 else:
                     entry = radix_cursor[h]
                     entry["page"] = page
+                if h in self._radix_nodes and self._radix_nodes[h][1] is not radix_cursor:
+                    # Same chained hash reached at a different depth: `_radix_nodes`
+                    # can only remember one parent, so future evictions of `h` must
+                    # use the full bottom-up scan instead of the O(1) fast path.
+                    self._multi_depth_hashes.add(h)
                 self._radix_nodes[h] = (parent_hash, radix_cursor, entry)
                 parent_hash = h
                 radix_cursor = entry["children"]
