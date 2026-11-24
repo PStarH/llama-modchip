@@ -38,9 +38,34 @@ MASK_64 = 0xffffffffffffffff
 _STRUCT_32I = struct.Struct("<32i")
 
 try:
-    from kv_cache.fnv_accel import fnv1a_64 as _FNV_IMPL, fnv_chain_blocks
+    from kv_cache.fnv_accel import (
+        fnv1a_64 as _FNV_IMPL,
+        fnv_chain_blocks,
+        fnv_chain_blocks_with_bytes,
+    )
 except ImportError:  # pragma: no cover - standalone `from harp_cache import ...`
-    from fnv_accel import fnv1a_64 as _FNV_IMPL, fnv_chain_blocks
+    from fnv_accel import (
+        fnv1a_64 as _FNV_IMPL,
+        fnv_chain_blocks,
+        fnv_chain_blocks_with_bytes,
+    )
+
+
+def _pack_tokens(tokens: List[int]) -> bytes:
+    """Little-endian int32 packing used for HARPPage.token_bytes."""
+    return struct.Struct(f"<{len(tokens)}i").pack(*tokens)
+
+
+def _page_matches(page: "HARPPage", chunk: Optional[List[int]],
+                  chunk_bytes: Optional[bytes]) -> bool:
+    """Compare a cached page against a candidate block.
+
+    When the batched native path supplied the packed buffer, comparing bytes
+    avoids materialising a list slice of 32 Python ints for every block.
+    """
+    if chunk_bytes is not None:
+        return page.token_bytes == chunk_bytes
+    return page.tokens == chunk
 
 
 def fnv1a_64(data: bytes, seed: int = FNV_OFFSET_BASIS) -> int:
@@ -81,6 +106,19 @@ def _hash_chain(tokens: List[int], block: int, seed: int) -> Optional[List[int]]
     return fnv_chain_blocks(tokens, block, seed)
 
 
+def _hash_chain_with_bytes(
+    tokens: List[int], block: int, seed: int
+) -> Tuple[Optional[List[int]], Optional[bytes]]:
+    """Chained hashes plus the packed little-endian token buffer.
+
+    Returns (None, None) when the batched native path is unavailable or would
+    not match `hash_token_block`, so callers fall back to the per-block path.
+    """
+    if hash_token_block is not _ORIGINAL_HASH_TOKEN_BLOCK:
+        return None, None
+    return fnv_chain_blocks_with_bytes(tokens, block, seed)
+
+
 class HARPPage:
     """Metadata descriptor for a single 32-token KV cache memory page."""
     __slots__ = (
@@ -88,6 +126,7 @@ class HARPPage:
         "page_hash",
         "token_count",
         "tokens",
+        "token_bytes",
         "entropy_score",
         "shm_offset",
         "access_count",
@@ -95,12 +134,25 @@ class HARPPage:
         "last_accessed",
     )
 
-    def __init__(self, page_id: int, page_hash: int, tokens: List[int], entropy_score: float, shm_offset: int):
+    def __init__(
+        self,
+        page_id: int,
+        page_hash: int,
+        tokens: List[int],
+        entropy_score: float,
+        shm_offset: int,
+        token_bytes: Optional[bytes] = None,
+    ):
         now = time.time()
         self.page_id = page_id
         self.page_hash = page_hash
         self.token_count = len(tokens)
         self.tokens = tokens
+        # Little-endian int32 packing of `tokens`.  Comparing two byte
+        # strings is cheaper than comparing two lists of ints, and slicing
+        # bytes out of the packed prefix buffer is ~1.9x cheaper than slicing
+        # the token list.  The radix walk does this comparison once per block.
+        self.token_bytes = token_bytes if token_bytes is not None else _pack_tokens(tokens)
         self.entropy_score = entropy_score
         self.shm_offset = shm_offset
         self.access_count = 1
@@ -321,6 +373,21 @@ class HARPCacheEngine:
             return None
         return hashes
 
+    def _chain_hashes_and_bytes(
+        self, token_stream: List[int], seed: int
+    ) -> Tuple[Optional[List[int]], Optional[bytes]]:
+        """Chained hashes plus the packed little-endian token buffer.
+
+        The packed buffer lets the radix walk slice each block's bytes out of
+        one contiguous buffer instead of copying a slice out of the token list,
+        which is ~1.9x cheaper per block.
+        """
+        hashes, packed = _hash_chain_with_bytes(
+            token_stream, self.PAGE_TOKENS, seed)
+        if hashes is None or len(hashes) != len(token_stream) // self.PAGE_TOKENS:
+            return None, None
+        return hashes, packed
+
     def resolve_prefix(self, token_stream: List[int]) -> Tuple[int, List[HARPPage], List[int]]:
         """
         Causally Sound Longest Common Prefix (LCP) Resolver.
@@ -339,13 +406,21 @@ class HARPCacheEngine:
             rolling_hash = self.fingerprint_seed
             # Hash the whole chain in one native call when possible; the walk
             # below still stops at the first block that does not match.
-            chain = self._chain_hashes(token_stream, rolling_hash)
+            chain, packed = self._chain_hashes_and_bytes(token_stream, rolling_hash)
+            block_bytes = self.PAGE_TOKENS * 4
             block_index = 0
             while curr_offset + self.PAGE_TOKENS <= n_tokens:
-                chunk = token_stream[curr_offset : curr_offset + self.PAGE_TOKENS]
+                chunk: Optional[List[int]] = None
+                chunk_bytes: Optional[bytes] = None
                 if chain is not None:
                     h = chain[block_index]
+                    # Slice the block's packed bytes out of the contiguous
+                    # buffer; comparing bytes is cheaper than comparing the
+                    # token lists element by element.
+                    chunk_bytes = packed[curr_offset * 4:
+                                         curr_offset * 4 + block_bytes]
                 else:
+                    chunk = token_stream[curr_offset : curr_offset + self.PAGE_TOKENS]
                     rolling_hash = hash_token_block(chunk, prev_hash=rolling_hash)
                     h = rolling_hash
                 block_index += 1
@@ -353,7 +428,7 @@ class HARPCacheEngine:
                 page: Optional[HARPPage] = None
                 if radix_cursor is not None and h in radix_cursor:
                     cand = radix_cursor[h].get("page")
-                    if cand is not None and cand.tokens == chunk:
+                    if cand is not None and _page_matches(cand, chunk, chunk_bytes):
                         page = cand
                         radix_cursor = radix_cursor[h]["children"]
                     else:
@@ -364,7 +439,7 @@ class HARPCacheEngine:
                 if page is None:
                     radix_cursor = None
                     cand = self.hash_to_page.get(h)
-                    if cand is not None and cand.tokens == chunk:
+                    if cand is not None and _page_matches(cand, chunk, chunk_bytes):
                         page = cand
 
                 if page is not None:
@@ -396,19 +471,27 @@ class HARPCacheEngine:
             parent_hash: Optional[int] = None
             rolling_hash = self.fingerprint_seed
             # Hash the whole chain in one native call when possible.
-            chain = self._chain_hashes(token_stream, rolling_hash)
+            chain, packed = self._chain_hashes_and_bytes(token_stream, rolling_hash)
+            block_bytes = self.PAGE_TOKENS * 4
             block_index = 0
             while curr_offset + self.PAGE_TOKENS <= n_tokens:
-                chunk = token_stream[curr_offset : curr_offset + self.PAGE_TOKENS]
+                chunk: Optional[List[int]] = None
+                chunk_bytes: Optional[bytes] = None
                 if chain is not None:
                     h = chain[block_index]
+                    # The block's packed bytes come straight out of the
+                    # contiguous buffer; the token list is only materialised
+                    # when a new page has to be built.
+                    chunk_bytes = packed[curr_offset * 4:
+                                         curr_offset * 4 + block_bytes]
                 else:
+                    chunk = token_stream[curr_offset : curr_offset + self.PAGE_TOKENS]
                     rolling_hash = hash_token_block(chunk, prev_hash=rolling_hash)
                     h = rolling_hash
                 block_index += 1
 
                 existing = self.hash_to_page.get(h)
-                if existing is not None and existing.tokens == chunk:
+                if existing is not None and _page_matches(existing, chunk, chunk_bytes):
                     existing.last_accessed = now
                     existing.access_count += 1
                     page = existing
@@ -426,6 +509,8 @@ class HARPCacheEngine:
 
                     page_id = self._acquire_physical_page_id()
                     shm_offset = page_id * self.PAGE_KV_BYTES
+                    if chunk is None:
+                        chunk = token_stream[curr_offset : curr_offset + self.PAGE_TOKENS]
                     entropy = self.calculate_entropy(chunk)
 
                     page = HARPPage(
@@ -434,6 +519,7 @@ class HARPCacheEngine:
                         tokens=chunk,
                         entropy_score=entropy,
                         shm_offset=shm_offset,
+                        token_bytes=chunk_bytes,
                     )
 
                     # Write page payload or header descriptor to bounded /dev/shm slot

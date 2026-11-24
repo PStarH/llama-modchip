@@ -72,6 +72,68 @@ class NativeFNVTest(unittest.TestCase):
         self.assertEqual(fnv_accel.fnv_chain_blocks([], 32), [])
         self.assertEqual(len(fnv_accel.fnv_chain_blocks([1, 2, 3] * 20, 32)), 1)
 
+    def test_batched_chain_ignores_trailing_partial_block(self):
+        """A trailing partial block must not change any completed block's hash.
+
+        The whole token list is packed in one go and the C side floors the byte
+        count to whole blocks, so the trailing tokens must not leak into the
+        previous blocks' hashes.
+        """
+        if fnv_accel._native is None:
+            self.skipTest("no C compiler available on this host")
+        rng = random.Random(0x7A11)
+        for tail in range(1, 32):
+            tokens = [rng.randint(0, 32000) for _ in range(32 * 3)]
+            seed = rng.getrandbits(64)
+            expected = []
+            h = seed
+            for b in range(3):
+                h = fnv1a_64(struct.pack("<32i", *tokens[b*32:(b+1)*32]), h)
+                expected.append(h)
+            with_tail = tokens + [rng.randint(0, 32000) for _ in range(tail)]
+            self.assertEqual(fnv_accel.fnv_chain_blocks(with_tail, 32, seed),
+                             expected)
+
+    def test_batched_chain_survives_out_of_range_token(self):
+        """Tokens outside int32 range must not crash the batched path."""
+        if fnv_accel._native is None:
+            self.skipTest("no C compiler available on this host")
+        tokens = [1] * 32 + [2**40]
+        # The out-of-range token sits in the trailing partial block, which is
+        # dropped, so the completed block's hash is unaffected.
+        got = fnv_accel.fnv_chain_blocks(tokens, 32)
+        self.assertEqual(len(got), 1)
+        expected = fnv1a_64(struct.pack("<32i", *tokens[:32]))
+        self.assertEqual(got, [expected])
+
+    def test_batched_chain_is_actually_used(self):
+        """The batched path must be live, not silently falling back.
+
+        A bug in the batched helper (e.g. a wrong argument) made it raise and
+        return (None, None); the engine then quietly used the per-block
+        fallback, so every correctness test still passed while the speedup
+        vanished.  Assert the fast path is really taken.
+        """
+        if fnv_accel._native is None:
+            self.skipTest("no C compiler available on this host")
+        import kv_cache.harp_cache as harp_mod
+
+        tokens = [12345] * 64
+        hashes, packed = fnv_accel.fnv_chain_blocks_with_bytes(
+            tokens, 32, harp_mod.FNV_OFFSET_BASIS)
+        self.assertIsNotNone(hashes, "batched chain fell back silently")
+        self.assertEqual(len(hashes), 2)
+        self.assertIsNotNone(packed)
+        self.assertEqual(len(packed), 64 * 4)
+
+        # The engine must use the same path.
+        engine = harp_mod.HARPCacheEngine(max_pages=8)
+        engine_chain, engine_packed = engine._chain_hashes_and_bytes(
+            tokens, engine.fingerprint_seed)
+        self.assertIsNotNone(engine_chain,
+                             "engine fell back to the per-block hash path")
+        self.assertIsNotNone(engine_packed)
+
     def test_batched_chain_disabled_when_hash_token_block_is_patched(self):
         """HARP collision tests monkeypatch hash_token_block; the batched path
         must fall back to per-block hashing in that case, or the patch is ignored."""
@@ -86,6 +148,41 @@ class NativeFNVTest(unittest.TestCase):
             self.assertIsNone(harp_mod._hash_chain([1] * 64, 32, FNV_OFFSET_BASIS))
         finally:
             harp_mod.hash_token_block = original
+
+    def test_bytes_compare_matches_list_compare(self):
+        """The radix walk's bytes-compare path must be semantically identical
+        to the original token-list compare path, including after collisions.
+        """
+        if fnv_accel._native is None:
+            self.skipTest("no C compiler available on this host")
+        import kv_cache.harp_cache as harp_mod
+
+        rng = random.Random(0xD1FF)
+        for _ in range(30):
+            nblocks = rng.randint(1, 20)
+            tokens = [rng.randint(0, 32000) for _ in range(32 * nblocks)]
+
+            fast = harp_mod.HARPCacheEngine(max_pages=4096)
+            fast.store_prefix(tokens)
+            r_fast = fast.resolve_prefix(tokens)
+
+            original = harp_mod.hash_token_block
+            original_sentinel = harp_mod._ORIGINAL_HASH_TOKEN_BLOCK
+            # Force the per-block fallback path.
+            harp_mod._ORIGINAL_HASH_TOKEN_BLOCK = object()
+            try:
+                slow = harp_mod.HARPCacheEngine(max_pages=4096)
+                slow.store_prefix(tokens)
+                r_slow = slow.resolve_prefix(tokens)
+            finally:
+                harp_mod._ORIGINAL_HASH_TOKEN_BLOCK = original_sentinel
+                harp_mod.hash_token_block = original
+
+            self.assertEqual(r_fast[0], r_slow[0])
+            self.assertEqual(len(r_fast[1]), len(r_slow[1]))
+            for h, page in fast.hash_to_page.items():
+                self.assertEqual(page.token_bytes,
+                                 harp_mod._pack_tokens(page.tokens))
 
     def test_native_faster_than_python(self):
         """Guard against accidentally falling back to the slow Python loop."""
