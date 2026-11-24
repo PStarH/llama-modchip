@@ -7,6 +7,7 @@ compiler is available.
 """
 
 import random
+import struct
 import unittest
 
 from kv_cache import fnv_accel
@@ -23,7 +24,7 @@ class NativeFNVTest(unittest.TestCase):
             data = bytes(rng.getrandbits(8) for _ in range(rng.randint(0, 512)))
             seed = rng.getrandbits(64)
             self.assertEqual(
-                fnv_accel._native(data, len(data), seed),
+                fnv_accel._native[0](data, len(data), seed),
                 fnv_accel._fnv1a_python(data, seed),
             )
 
@@ -47,6 +48,44 @@ class NativeFNVTest(unittest.TestCase):
         h1 = hash_token_block(block, prev_hash=h0)
         self.assertNotEqual(h0, h1)
         self.assertEqual(h0, fnv1a_64(__import__("struct").pack("<32i", *block)))
+
+    def test_batched_chain_bit_identical_to_per_block(self):
+        """The batched native chain must equal sequential hash_token_block calls."""
+        if fnv_accel._native is None:
+            self.skipTest("no C compiler available on this host")
+        rng = random.Random(0x5EED)
+        for _ in range(100):
+            nblocks = rng.randint(1, 40)
+            tokens = [rng.randint(-(2**31), 2**31 - 1) for _ in range(32 * nblocks)]
+            seed = rng.getrandbits(64)
+            expected = []
+            h = seed
+            for b in range(nblocks):
+                h = fnv1a_64(struct.pack("<32i", *tokens[b*32:(b+1)*32]), h)
+                expected.append(h)
+            got = fnv_accel.fnv_chain_blocks(tokens, 32, seed)
+            self.assertEqual(got, expected)
+
+    def test_batched_chain_handles_empty_and_partial_tail(self):
+        if fnv_accel._native is None:
+            self.skipTest("no C compiler available on this host")
+        self.assertEqual(fnv_accel.fnv_chain_blocks([], 32), [])
+        self.assertEqual(len(fnv_accel.fnv_chain_blocks([1, 2, 3] * 20, 32)), 1)
+
+    def test_batched_chain_disabled_when_hash_token_block_is_patched(self):
+        """HARP collision tests monkeypatch hash_token_block; the batched path
+        must fall back to per-block hashing in that case, or the patch is ignored."""
+        import kv_cache.harp_cache as harp_mod
+
+        if harp_mod._ORIGINAL_HASH_TOKEN_BLOCK is not harp_mod.hash_token_block:
+            self.skipTest("hash_token_block already patched by another test")
+        original = harp_mod.hash_token_block
+        try:
+            self.assertIsNotNone(harp_mod._hash_chain([1] * 64, 32, FNV_OFFSET_BASIS))
+            harp_mod.hash_token_block = lambda tokens, prev_hash=FNV_OFFSET_BASIS: 999
+            self.assertIsNone(harp_mod._hash_chain([1] * 64, 32, FNV_OFFSET_BASIS))
+        finally:
+            harp_mod.hash_token_block = original
 
     def test_native_faster_than_python(self):
         """Guard against accidentally falling back to the slow Python loop."""
